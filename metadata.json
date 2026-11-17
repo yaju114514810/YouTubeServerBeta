@@ -1,0 +1,6 @@
+{
+  "name": "KuroStream Invidious API",
+  "description": "Ultra-fast, 4K/HDR-capable Invidious-compatible REST API gateway, adaptive stream proxy, and developer console.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
