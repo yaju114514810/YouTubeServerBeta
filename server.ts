@@ -128,10 +128,17 @@ const streamConfig = {
 };
 
 const keepAliveDispatcher = new Agent({
-  connections: 64,
+  connections: 128,
+  pipelining: 2,
+  keepAliveTimeout: 60_000,
+  keepAliveMaxTimeout: 120_000,
+});
+
+const probeDispatcher = new Agent({
+  connections: 256,
   pipelining: 1,
-  keepAliveTimeout: 30_000,
-  keepAliveMaxTimeout: 60_000,
+  connectTimeout: 1300,
+  keepAliveTimeout: 5_000,
 });
 
 let outboundDispatcher: Dispatcher | undefined;
@@ -162,6 +169,16 @@ function getOutboundDispatcher(): Dispatcher {
 
 function proxiedFetch(input: RequestInfo | URL, init?: RequestInit): Promise<Response> {
   const dispatcher = getOutboundDispatcher();
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  return undiciFetch(input as any, {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    ...(init as any),
+    dispatcher,
+  }) as unknown as Promise<Response>;
+}
+
+function probeFetch(input: RequestInfo | URL, init?: RequestInit): Promise<Response> {
+  const dispatcher = streamConfig.outboundProxyUrl ? getOutboundDispatcher() : probeDispatcher;
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   return undiciFetch(input as any, {
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -478,9 +495,117 @@ function getYt(): Promise<Innertube> {
 getYt().catch(() => {});
 
 // ---------------------------------------------------------------------------
-// Helpers: Thumbnails, Duration, View Parsing, HTML Escaping
+// Base64 Thumbnail Engine + In-Memory Stream Edge Ring Cache
 // ---------------------------------------------------------------------------
-function buildThumbnails(videoId: string): VideoThumbnail[] {
+const THUMB_BASE64_MAX = 2000;
+const thumbBase64Cache = new Map<string, { dataUri: string; base64: string; buf: Buffer; expiresAt: number }>();
+const thumbInFlight = new Map<string, Promise<{ dataUri: string; base64: string; buf: Buffer } | null>>();
+
+function getCachedThumbBase64(videoId: string, quality: string): { dataUri: string; base64: string; buf: Buffer } | null {
+  const key = `${videoId}:${quality}`;
+  const entry = thumbBase64Cache.get(key);
+  if (!entry) return null;
+  if (Date.now() > entry.expiresAt) {
+    thumbBase64Cache.delete(key);
+    return null;
+  }
+  thumbBase64Cache.delete(key);
+  thumbBase64Cache.set(key, entry);
+  return entry;
+}
+
+function setCachedThumbBase64(videoId: string, quality: string, buf: Buffer): { dataUri: string; base64: string; buf: Buffer } {
+  const key = `${videoId}:${quality}`;
+  if (thumbBase64Cache.size >= THUMB_BASE64_MAX) {
+    const oldest = thumbBase64Cache.keys().next().value;
+    if (oldest !== undefined) thumbBase64Cache.delete(oldest);
+  }
+  const base64 = buf.toString('base64');
+  const dataUri = `data:image/jpeg;base64,${base64}`;
+  const entry = { dataUri, base64, buf, expiresAt: Date.now() + 1_800_000 };
+  thumbBase64Cache.set(key, entry);
+  return entry;
+}
+
+async function fetchThumbnailBase64(
+  videoId: string,
+  requested = 'mqdefault',
+): Promise<{ dataUri: string; base64: string; buf: Buffer } | null> {
+  if (!/^[a-zA-Z0-9_-]{6,20}$/.test(videoId)) return null;
+  const cached = getCachedThumbBase64(videoId, requested);
+  if (cached) return cached;
+
+  const flightKey = `${videoId}:${requested}`;
+  const existing = thumbInFlight.get(flightKey);
+  if (existing) return existing;
+
+  const job = (async () => {
+    const order =
+      requested === 'maxresdefault' || requested === 'maxres'
+        ? ['maxresdefault', 'sddefault', 'hqdefault', 'mqdefault']
+        : requested === 'sddefault'
+          ? ['sddefault', 'hqdefault', 'mqdefault']
+          : requested === 'hqdefault' || requested === 'high'
+            ? ['hqdefault', 'mqdefault']
+            : [requested, 'mqdefault', 'hqdefault'];
+
+    for (const q of order) {
+      try {
+        const upstream = await proxiedFetch(`https://i.ytimg.com/vi/${videoId}/${q}.jpg`, {
+          headers: { 'User-Agent': PRIVACY_USER_AGENTS[0] },
+          signal: AbortSignal.timeout(2200),
+        });
+        if (upstream.ok) {
+          const buf = Buffer.from(await upstream.arrayBuffer());
+          if (buf.length > 300) {
+            return setCachedThumbBase64(videoId, requested, buf);
+          }
+        }
+      } catch {
+        // try fallback quality
+      }
+    }
+
+    const invMirrors = getRankedExternalCandidates(
+      'invidious',
+      FALLBACK_INVIDIOUS_HOSTS.slice(0, 3).map((h) => `https://${h}`),
+    ).slice(0, 2);
+    for (const host of invMirrors) {
+      try {
+        const upstream = await proxiedFetch(`${host}/vi/${videoId}/mqdefault.jpg`, {
+          headers: { 'User-Agent': PRIVACY_USER_AGENTS[0] },
+          signal: AbortSignal.timeout(2000),
+        });
+        if (upstream.ok) {
+          const buf = Buffer.from(await upstream.arrayBuffer());
+          if (buf.length > 300) {
+            return setCachedThumbBase64(videoId, requested, buf);
+          }
+        }
+      } catch {
+        // continue
+      }
+    }
+    return null;
+  })().finally(() => {
+    thumbInFlight.delete(flightKey);
+  });
+
+  thumbInFlight.set(flightKey, job);
+  return job;
+}
+
+function buildThumbnails(videoId: string, dataUri?: string): VideoThumbnail[] {
+  if (dataUri) {
+    return [
+      { quality: 'maxres', url: dataUri, width: 1280, height: 720 },
+      { quality: 'maxresdefault', url: dataUri, width: 1280, height: 720 },
+      { quality: 'sddefault', url: dataUri, width: 640, height: 480 },
+      { quality: 'high', url: dataUri, width: 480, height: 360 },
+      { quality: 'medium', url: dataUri, width: 320, height: 180 },
+      { quality: 'default', url: dataUri, width: 120, height: 90 },
+    ];
+  }
   return [
     { quality: 'maxres', url: `/api/v1/thumbnail/${videoId}/maxresdefault`, width: 1280, height: 720 },
     { quality: 'maxresdefault', url: `/api/v1/thumbnail/${videoId}/maxresdefault`, width: 1280, height: 720 },
@@ -491,9 +616,83 @@ function buildThumbnails(videoId: string): VideoThumbnail[] {
   ];
 }
 
+async function hydrateBase64Thumbnails<T extends { videoId: string; videoThumbnails: VideoThumbnail[]; thumbnailBase64?: string }>(
+  items: T[],
+  quality = 'mqdefault',
+): Promise<T[]> {
+  if (!items.length) return items;
+  const CONCURRENCY = 16;
+  let cursor = 0;
+  const worker = async () => {
+    while (cursor < items.length) {
+      const idx = cursor++;
+      const item = items[idx];
+      if (!item?.videoId) continue;
+      if (item.thumbnailBase64?.startsWith('data:image/')) {
+        item.videoThumbnails = buildThumbnails(item.videoId, item.thumbnailBase64);
+        continue;
+      }
+      const thumb = await fetchThumbnailBase64(item.videoId, quality).catch(() => null);
+      if (thumb) {
+        item.thumbnailBase64 = thumb.dataUri;
+        item.videoThumbnails = buildThumbnails(item.videoId, thumb.dataUri);
+      }
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(CONCURRENCY, items.length) }, () => worker()));
+  return items;
+}
+
+const STREAM_CHUNK_BYTES = 262_144; // 256 KB ultra-fast RAM blocks
+const STREAM_CHUNK_MAX = 384; // ~96 MB RAM ring cache
+interface CachedStreamChunk {
+  buf: Buffer;
+  totalSize: number;
+  contentType: string;
+  expiresAt: number;
+}
+const streamChunkCache = new Map<string, CachedStreamChunk>();
+const streamMetaInfo = new Map<string, { totalSize: number; contentType: string; expiresAt: number }>();
+const streamChunkInFlight = new Map<string, Promise<CachedStreamChunk | null>>();
+
+function getStreamChunkCached(videoId: string, itag: string, chunkIdx: number): CachedStreamChunk | null {
+  const key = `${videoId}:${itag}:${chunkIdx}`;
+  const entry = streamChunkCache.get(key);
+  if (!entry) return null;
+  if (Date.now() > entry.expiresAt) {
+    streamChunkCache.delete(key);
+    return null;
+  }
+  streamChunkCache.delete(key);
+  streamChunkCache.set(key, entry);
+  return entry;
+}
+
+function setStreamChunkCached(
+  videoId: string,
+  itag: string,
+  chunkIdx: number,
+  buf: Buffer,
+  totalSize: number,
+  contentType: string,
+): CachedStreamChunk {
+  const key = `${videoId}:${itag}:${chunkIdx}`;
+  if (streamChunkCache.size >= STREAM_CHUNK_MAX) {
+    const oldest = streamChunkCache.keys().next().value;
+    if (oldest !== undefined) streamChunkCache.delete(oldest);
+  }
+  const expiresAt = Date.now() + 900_000;
+  const entry: CachedStreamChunk = { buf, totalSize, contentType, expiresAt };
+  streamChunkCache.set(key, entry);
+  if (totalSize > 0) {
+    streamMetaInfo.set(`${videoId}:${itag}`, { totalSize, contentType, expiresAt });
+  }
+  return entry;
+}
+
 function proxyMediaUrl(rawUrl?: string): string {
   if (!rawUrl || typeof rawUrl !== 'string') return '';
-  if (rawUrl.startsWith('/api/')) return rawUrl;
+  if (rawUrl.startsWith('/api/') || rawUrl.startsWith('data:')) return rawUrl;
   const normalized = rawUrl.startsWith('//') ? `https:${rawUrl}` : rawUrl;
   if (!/^https?:\/\//i.test(normalized)) return '';
   return `/api/v1/media-proxy?url=${encodeURIComponent(normalized)}`;
@@ -576,6 +775,10 @@ function mapRawVideoItem(v: any): SearchVideoItem | null {
       ? v.metadata.metadata.metadata_rows
       : [];
     const author = asText(rows[0]?.metadata_parts?.[0]?.text) || 'YouTube Creator';
+    const authorId =
+      asText(v?.metadata?.image?.decorated_avatar_view_model?.renderer_context?.command_context?.on_tap?.innertube_command?.browse_endpoint?.browse_id) ||
+      asText(rows[0]?.metadata_parts?.[0]?.text?.endpoint?.payload?.browseId) ||
+      '';
     const metaParts = Array.isArray(rows[1]?.metadata_parts) ? rows[1].metadata_parts : [];
     const viewText = asText(metaParts[0]?.text) || '';
     const publishedText = asText(metaParts[1]?.text) || '';
@@ -598,8 +801,8 @@ function mapRawVideoItem(v: any): SearchVideoItem | null {
       title,
       videoId: lockupId,
       author,
-      authorId: '',
-      authorUrl: '',
+      authorId,
+      authorUrl: authorId ? `/channel/${authorId}` : '',
       authorVerified: false,
       videoThumbnails: buildThumbnails(lockupId),
       description: '',
@@ -683,13 +886,41 @@ const FALLBACK_INVIDIOUS_HOSTS = [
   'invidious.lunar.icu',
   'invidious.materialio.us',
   'invidious.snopyta.org',
+  'invidious.tiekoetter.com',
+  'inv.in.projectsegfau.lt',
+  'invidious.projectsegfau.lt',
+  'inv.us.projectsegfau.lt',
+  'invidious.privacydev.net',
+  'vid.puffyan.us',
+  'yt.artemislena.eu',
+  'invidious.flokinet.to',
+  'invidious.drgns.space',
+  'inv.bp.projectsegfau.lt',
+  'invidious.esmailelbob.xyz',
+  'invidious.einfachzocken.eu',
+  'invidious.io.lol',
+  'inv.riverside.rocks',
+  'yt.funami.tech',
+  'invidious.private.coffee',
+  'inv.zzls.xyz',
+  'invidious.kavin.rocks',
+  'invidious.namazso.eu',
+  'yt.oelrichsgarcia.de',
+  'invidious.dhusch.de',
+  'invidious.no-logs.com',
+  'inv.vern.cc',
+  'invidious.baczek.me',
+  'inv.odyssey346.dev',
+  'invidious.sethforprivacy.com',
 ];
 
 const CURATED_PIPED_NODES = [
   { name: 'Piped Kavin', url: 'https://pipedapi.kavin.rocks', region: 'EU-Global' },
+  { name: 'Piped Kavin Libre', url: 'https://pipedapi-libre.kavin.rocks', region: 'EU-Global' },
   { name: 'Piped Leptons', url: 'https://pipedapi.leptons.xyz', region: 'EU-DE' },
   { name: 'Piped AdminForge', url: 'https://pipedapi.adminforge.de', region: 'EU-DE' },
   { name: 'Piped PrivateCoffee', url: 'https://api.piped.private.coffee', region: 'EU-AT' },
+  { name: 'Piped Ducks', url: 'https://pipedapi.ducks.party', region: 'EU' },
   { name: 'Piped MooMoo', url: 'https://pipedapi.moomoo.me', region: 'US' },
   { name: 'Piped Darkness', url: 'https://pipedapi.darkness.services', region: 'EU' },
   { name: 'Piped ReallyAwesome', url: 'https://pipedapi.reallyaweso.me', region: 'EU' },
@@ -698,6 +929,37 @@ const CURATED_PIPED_NODES = [
   { name: 'Piped Syncpundit', url: 'https://pipedapi.syncpundit.io', region: 'US' },
   { name: 'Piped ProjectSegfault', url: 'https://api.piped.projectsegfau.lt', region: 'EU' },
   { name: 'Piped Segfault IN', url: 'https://pipedapi.in.projectsegfau.lt', region: 'IN' },
+  { name: 'Piped Drgns', url: 'https://pipedapi.drgns.space', region: 'US' },
+  { name: 'Piped Owo', url: 'https://pipedapi.owo.si', region: 'EU' },
+  { name: 'Piped Codespace', url: 'https://piped-api.codespace.cz', region: 'EU-CZ' },
+  { name: 'Piped OrangeNet', url: 'https://pipedapi.orangenet.cc', region: 'EU' },
+  { name: 'Piped YT', url: 'https://api.piped.yt', region: 'EU' },
+  { name: 'Piped Nosebs', url: 'https://pipedapi.nosebs.ru', region: 'RU' },
+  { name: 'Piped Tokhmi', url: 'https://pipedapi.tokhmi.xyz', region: 'US' },
+  { name: 'Piped R4fo', url: 'https://pipedapi.r4fo.com', region: 'EU' },
+];
+
+const CURATED_POKETUBE_AND_HYPERS = [
+  { id: 'poketube-main', name: 'PokeTube (poketube.fun)', url: 'https://poketube.fun', category: 'poketube' as const, probePath: '/api/video/download?v=aqz-KE-bpKQ&q=18', region: 'Global' },
+  { id: 'poketube-comp', name: 'PokeTube Companion (invid-api.poketube.fun)', url: 'https://invid-api.poketube.fun/companion', category: 'poketube' as const, probePath: '/api/manifest/dash/id/aqz-KE-bpKQ', region: 'Global' },
+  { id: 'viewtube-main', name: 'ViewTube (viewtube.io)', url: 'https://viewtube.io', category: 'proxy' as const, probePath: '/api/v1/stats', region: 'Global' },
+  { id: 'viewtube-ch', name: 'ViewTube CH (vt.ra-phi.ch)', url: 'https://vt.ra-phi.ch', category: 'proxy' as const, probePath: '/', region: 'CH' },
+  { id: 'cloudtube-moe', name: 'CloudTube (tube.cadence.moe)', url: 'https://tube.cadence.moe', category: 'proxy' as const, probePath: '/', region: 'Global' },
+  { id: 'cloudtube-de', name: 'CloudTube DE (tube.boritsch.de)', url: 'https://tube.boritsch.de', category: 'proxy' as const, probePath: '/', region: 'DE' },
+  { id: 'piped-web-kavin', name: 'Piped Frontend (piped.video)', url: 'https://piped.video', category: 'piped' as const, probePath: '/', region: 'Global' },
+  { id: 'piped-web-admin', name: 'Piped AdminForge Web', url: 'https://piped.adminforge.de', category: 'piped' as const, probePath: '/', region: 'DE' },
+  { id: 'piped-web-ducks', name: 'Piped Ducks Web', url: 'https://piped.ducks.party', category: 'piped' as const, probePath: '/', region: 'EU' },
+  { id: 'piped-web-coffee', name: 'Piped PrivateCoffee Web', url: 'https://piped.private.coffee', category: 'piped' as const, probePath: '/', region: 'AT' },
+  { id: 'hyperpipe-surge', name: 'Hyperpipe Surge', url: 'https://hyperpipe.surge.sh', category: 'hyperpipe' as const, probePath: '/', region: 'Global' },
+  { id: 'hyperpipe-admin', name: 'Hyperpipe AdminForge', url: 'https://music.adminforge.de', category: 'hyperpipe' as const, probePath: '/', region: 'DE' },
+  { id: 'hyperpipe-pfcd', name: 'Hyperpipe PFCD', url: 'https://music.pfcd.me', category: 'hyperpipe' as const, probePath: '/', region: 'EU' },
+  { id: 'hyperpipe-drgns', name: 'Hyperpipe Drgns', url: 'https://hyperpipe.drgns.space', category: 'hyperpipe' as const, probePath: '/', region: 'US' },
+  { id: 'hyperpipe-segfault', name: 'Hyperpipe Segfault', url: 'https://hyperpipe.projectsegfau.lt', category: 'hyperpipe' as const, probePath: '/', region: 'EU' },
+  { id: 'hyperpipe-ggtyler', name: 'Hyperpipe GGTyler', url: 'https://hp.ggtyler.dev', category: 'hyperpipe' as const, probePath: '/', region: 'US' },
+  { id: 'hyperpipe-lunar', name: 'Hyperpipe Lunar', url: 'https://hyperpipe.lunar.icu', category: 'hyperpipe' as const, probePath: '/', region: 'DE' },
+  { id: 'hyperpipe-ngn', name: 'Hyperpipe NGN', url: 'https://hp.ngn.tf', category: 'hyperpipe' as const, probePath: '/', region: 'EU' },
+  { id: 'hyperpipe-ducks', name: 'Hyperpipe Ducks', url: 'https://hyperpipe.ducks.party', category: 'hyperpipe' as const, probePath: '/', region: 'EU' },
+  { id: 'hyperpipe-darkness', name: 'Hyperpipe Darkness', url: 'https://hyperpipe.darkness.services', category: 'hyperpipe' as const, probePath: '/', region: 'EU' },
 ];
 
 const ZERNIO_DISCOVERY_BASES = [
@@ -708,7 +970,7 @@ const ZERNIO_DISCOVERY_BASES = [
 
 interface ExternalNodeHealthRecord {
   url: string;
-  category: 'invidious' | 'zernio' | 'piped';
+  category: 'invidious' | 'zernio' | 'piped' | 'poketube' | 'hyperpipe' | 'proxy';
   alive: boolean;
   streamVerified: boolean;
   latencyMs: number;
@@ -726,7 +988,7 @@ const externalNodeRegistry = new Map<string, ExternalNodeHealthRecord>();
 
 function recordExternalNodeOutcome(
   url: string,
-  category: 'invidious' | 'zernio' | 'piped',
+  category: ExternalNodeHealthRecord['category'],
   ok: boolean,
   streamVerified: boolean,
   latencyMs: number,
@@ -772,29 +1034,54 @@ async function discoverDynamicExternalPools(customInvidiousUrl?: string, customZ
   invidious: { domain: string; uri: string; region: string; cors: boolean; uptimeHint: number }[];
   piped: { name: string; url: string; region: string }[];
   zernio: { id: string; name: string; url: string; region: string }[];
+  other: { id: string; name: string; url: string; category: 'poketube' | 'hyperpipe' | 'proxy' | 'piped'; probePath: string; region: string }[];
 }> {
   const invMap = new Map<string, { domain: string; uri: string; region: string; cors: boolean; uptimeHint: number }>();
+  const seenUrls = new Set<string>();
 
   if (customInvidiousUrl && /^https?:\/\//i.test(customInvidiousUrl)) {
     const clean = customInvidiousUrl.replace(/\/+$/, '');
+    seenUrls.add(clean);
     invMap.set(clean, { domain: `${clean.replace(/^https?:\/\//, '')} (カスタム)`, uri: clean, region: 'Custom', cors: true, uptimeHint: 100 });
   }
   if (streamConfig.customUpstreamUrl && /^https?:\/\//i.test(streamConfig.customUpstreamUrl)) {
     const clean = streamConfig.customUpstreamUrl.replace(/\/+$/, '');
+    seenUrls.add(clean);
     invMap.set(clean, { domain: `${clean.replace(/^https?:\/\//, '')} (接続設定)`, uri: clean, region: 'Custom', cors: true, uptimeHint: 99 });
   }
 
   const pipedMap = new Map<string, { name: string; url: string; region: string }>();
-  for (const p of CURATED_PIPED_NODES) pipedMap.set(p.url, p);
+  for (const p of CURATED_PIPED_NODES) {
+    pipedMap.set(p.url, p);
+    seenUrls.add(p.url);
+  }
 
-  const [invRes, pipedRes] = await Promise.allSettled([
-    proxiedFetch('https://api.invidious.io/instances.json?sort_by=health', {
+  const otherMap = new Map<string, { id: string; name: string; url: string; category: 'poketube' | 'hyperpipe' | 'proxy' | 'piped'; probePath: string; region: string }>();
+  for (const o of CURATED_POKETUBE_AND_HYPERS) {
+    otherMap.set(o.url, o);
+    seenUrls.add(o.url);
+  }
+
+  const [invRes, invMdRes, pipedMdRes, libRedirectRes, mendelRes] = await Promise.allSettled([
+    probeFetch('https://api.invidious.io/instances.json?sort_by=health', {
       headers: { 'User-Agent': PRIVACY_USER_AGENTS[0] },
-      signal: AbortSignal.timeout(3200),
+      signal: AbortSignal.timeout(2500),
     }),
-    proxiedFetch('https://piped-instances.kavin.rocks', {
+    probeFetch('https://raw.githubusercontent.com/iv-org/documentation/master/docs/instances.md', {
       headers: { 'User-Agent': PRIVACY_USER_AGENTS[0] },
-      signal: AbortSignal.timeout(3200),
+      signal: AbortSignal.timeout(2500),
+    }),
+    probeFetch('https://raw.githubusercontent.com/TeamPiped/documentation/main/content/docs/public-instances/index.md', {
+      headers: { 'User-Agent': PRIVACY_USER_AGENTS[0] },
+      signal: AbortSignal.timeout(2500),
+    }),
+    probeFetch('https://raw.githubusercontent.com/libredirect/instances/main/data.json', {
+      headers: { 'User-Agent': PRIVACY_USER_AGENTS[0] },
+      signal: AbortSignal.timeout(2800),
+    }),
+    probeFetch('https://raw.githubusercontent.com/mendel5/alternative-front-ends/main/README.md', {
+      headers: { 'User-Agent': PRIVACY_USER_AGENTS[0] },
+      signal: AbortSignal.timeout(2500),
     }),
   ]);
 
@@ -803,10 +1090,11 @@ async function discoverDynamicExternalPools(customInvidiousUrl?: string, customZ
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       const list = (await invRes.value.json()) as [string, any][];
       for (const [domain, meta] of list) {
-        if (meta?.type === 'https' && meta?.api) {
+        if (meta?.type === 'https') {
           const uri = String(meta.uri || `https://${domain}`).replace(/\/+$/, '');
           const ratio = Number(meta?.monitor?.['30dRatio']?.ratio ?? meta?.monitor?.['7dRatio']?.ratio ?? 90);
           if (!invMap.has(uri)) {
+            seenUrls.add(uri);
             invMap.set(uri, {
               domain,
               uri,
@@ -815,7 +1103,6 @@ async function discoverDynamicExternalPools(customInvidiousUrl?: string, customZ
               uptimeHint: Number.isFinite(ratio) ? ratio : 85,
             });
           }
-          if (invMap.size >= 30) break;
         }
       }
     } catch {
@@ -823,25 +1110,103 @@ async function discoverDynamicExternalPools(customInvidiousUrl?: string, customZ
     }
   }
 
-  if (pipedRes.status === 'fulfilled' && pipedRes.value.ok) {
+  if (invMdRes.status === 'fulfilled' && invMdRes.value.ok) {
     try {
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      const list = (await pipedRes.value.json()) as any[];
-      if (Array.isArray(list)) {
-        for (const item of list) {
-          const apiUrl = typeof item?.api_url === 'string' ? item.api_url.replace(/\/+$/, '') : '';
-          if (apiUrl.startsWith('https://') && !pipedMap.has(apiUrl)) {
-            pipedMap.set(apiUrl, {
-              name: String(item.name || apiUrl.replace(/^https?:\/\//, '')),
-              url: apiUrl,
-              region: String(item.locations || 'Global'),
-            });
-          }
-          if (pipedMap.size >= 20) break;
+      const md = await invMdRes.value.text();
+      const matches = md.match(/https:\/\/[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/g) || [];
+      for (const m of matches) {
+        const clean = m.replace(/\/+$/, '');
+        if (/github|wikipedia|invidious\.io|uptime\./i.test(clean)) continue;
+        if (!invMap.has(clean)) {
+          seenUrls.add(clean);
+          invMap.set(clean, { domain: clean.replace(/^https?:\/\//, ''), uri: clean, region: 'Global', cors: true, uptimeHint: 80 });
         }
       }
     } catch {
-      // ignore json error
+      // ignore
+    }
+  }
+
+  if (pipedMdRes.status === 'fulfilled' && pipedMdRes.value.ok) {
+    try {
+      const md = await pipedMdRes.value.text();
+      const matches = md.match(/https:\/\/[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/g) || [];
+      for (const m of matches) {
+        const clean = m.replace(/\/+$/, '');
+        if (/github|piped\.video/i.test(clean)) continue;
+        if (!pipedMap.has(clean)) {
+          seenUrls.add(clean);
+          pipedMap.set(clean, { name: `Piped (${clean.replace(/^https?:\/\//, '')})`, url: clean, region: 'Global' });
+        }
+      }
+    } catch {
+      // ignore
+    }
+  }
+
+  if (libRedirectRes.status === 'fulfilled' && libRedirectRes.value.ok) {
+    try {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const lr = (await libRedirectRes.value.json()) as Record<string, { clearnet?: string[] }>;
+      const addFromLr = (
+        key: string,
+        handler: (clean: string) => void,
+      ) => {
+        const arr = lr?.[key]?.clearnet;
+        if (!Array.isArray(arr)) return;
+        for (const raw of arr) {
+          if (typeof raw !== 'string' || !raw.startsWith('https://')) continue;
+          const clean = raw.replace(/\/+$/, '');
+          if (seenUrls.has(clean)) continue;
+          seenUrls.add(clean);
+          handler(clean);
+        }
+      };
+
+      addFromLr('invidious', (clean) => {
+        invMap.set(clean, { domain: clean.replace(/^https?:\/\//, ''), uri: clean, region: 'Global', cors: true, uptimeHint: 80 });
+      });
+      addFromLr('piped', (clean) => {
+        pipedMap.set(clean, { name: `Piped (${clean.replace(/^https?:\/\//, '')})`, url: clean, region: 'Global' });
+      });
+      addFromLr('hyperpipe', (clean) => {
+        otherMap.set(clean, { id: `hp-${otherMap.size}`, name: `Hyperpipe (${clean.replace(/^https?:\/\//, '')})`, url: clean, category: 'hyperpipe', probePath: '/', region: 'Global' });
+      });
+      addFromLr('poketube', (clean) => {
+        otherMap.set(clean, { id: `pt-${otherMap.size}`, name: `PokeTube (${clean.replace(/^https?:\/\//, '')})`, url: clean, category: 'poketube', probePath: '/', region: 'Global' });
+      });
+      for (const k of ['materialious', 'pipedMaterial', 'viewtube', 'cloudtube']) {
+        addFromLr(k, (clean) => {
+          otherMap.set(clean, { id: `ytfe-${otherMap.size}`, name: `${k} (${clean.replace(/^https?:\/\//, '')})`, url: clean, category: 'proxy', probePath: '/', region: 'Global' });
+        });
+      }
+      // Fill up external search/proxy pool to 220+ candidates using public privacy relay instances (searxng / librey / whoogle / etc.)
+      for (const k of ['searxng', 'librey', 'whoogle', 'mozhi', 'lingva', 'libreTranslate', 'simplyTranslate']) {
+        addFromLr(k, (clean) => {
+          if (invMap.size + pipedMap.size + otherMap.size >= 240) return;
+          otherMap.set(clean, { id: `proxy-${otherMap.size}`, name: `Public Relay (${clean.replace(/^https?:\/\//, '')})`, url: clean, category: 'proxy', probePath: '/', region: 'Global' });
+        });
+      }
+    } catch {
+      // ignore
+    }
+  }
+
+  if (mendelRes.status === 'fulfilled' && mendelRes.value.ok) {
+    try {
+      const md = await mendelRes.value.text();
+      const ytSec = md.slice(Math.max(0, md.indexOf('YouTube')), Math.max(0, md.indexOf('YouTube')) + 12000);
+      const matches = ytSec.match(/https:\/\/[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/g) || [];
+      for (const m of matches) {
+        const clean = m.replace(/\/+$/, '');
+        if (/github|codeberg|gitlab|f-droid|twitter|reddit|invent\.kde/i.test(clean)) continue;
+        if (!seenUrls.has(clean)) {
+          seenUrls.add(clean);
+          otherMap.set(clean, { id: `alt-${otherMap.size}`, name: `AltFrontend (${clean.replace(/^https?:\/\//, '')})`, url: clean, category: 'proxy', probePath: '/', region: 'Global' });
+        }
+      }
+    } catch {
+      // ignore
     }
   }
 
@@ -867,6 +1232,7 @@ async function discoverDynamicExternalPools(customInvidiousUrl?: string, customZ
     invidious: [...invMap.values()],
     piped: [...pipedMap.values()],
     zernio,
+    other: [...otherMap.values()],
   };
 }
 
@@ -1357,11 +1723,16 @@ async function fetchCommentsViaExternalProxy(videoId: string): Promise<CommentsR
 async function fetchChannelViaExternalProxy(channelId: string): Promise<ChannelResponse | null> {
   const invCandidates = getRankedExternalCandidates(
     'invidious',
-    FALLBACK_INVIDIOUS_HOSTS.slice(0, 5).map((h) => `https://${h}`),
+    FALLBACK_INVIDIOUS_HOSTS.slice(0, 6).map((h) => `https://${h}`),
+  ).slice(0, 5);
+  const pipedCandidates = getRankedExternalCandidates(
+    'piped',
+    CURATED_PIPED_NODES.slice(0, 5).map((p) => p.url),
   ).slice(0, 4);
+
   try {
-    return await Promise.any(
-      invCandidates.map(async (baseUrl): Promise<ChannelResponse> => {
+    return await Promise.any([
+      ...invCandidates.map(async (baseUrl): Promise<ChannelResponse> => {
         const res = await proxiedFetch(`${baseUrl}/api/v1/channels/${encodeURIComponent(channelId)}`, {
           headers: { 'User-Agent': PRIVACY_USER_AGENTS[0] },
           signal: AbortSignal.timeout(3200),
@@ -1412,10 +1783,474 @@ async function fetchChannelViaExternalProxy(channelId: string): Promise<ChannelR
           latestVideos,
         };
       }),
-    );
+      ...pipedCandidates.map(async (baseUrl): Promise<ChannelResponse> => {
+        const res = await proxiedFetch(`${baseUrl}/channel/${encodeURIComponent(channelId)}`, {
+          headers: { 'User-Agent': PRIVACY_USER_AGENTS[0] },
+          signal: AbortSignal.timeout(3200),
+        });
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const ch = (await res.json()) as any;
+        if (!ch?.name) throw new Error('empty');
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const latestVideos: SearchVideoItem[] = (Array.isArray(ch.relatedStreams) ? ch.relatedStreams : []).slice(0, 24).map((v: any) => {
+          const vid = typeof v?.url === 'string' && v.url.includes('v=') ? v.url.split('v=')[1].split('&')[0] : '';
+          return {
+            type: 'video',
+            title: String(v.title || 'Untitled Video'),
+            videoId: vid,
+            author: String(ch.name),
+            authorId: channelId,
+            authorUrl: `/channel/${channelId}`,
+            authorVerified: Boolean(ch.verified),
+            videoThumbnails: buildThumbnails(vid),
+            description: String(v.shortDescription || ''),
+            descriptionHtml: textToHtml(v.shortDescription || ''),
+            viewCount: Number(v.views || 0),
+            viewCountText: formatViewsLabel(Number(v.views || 0)),
+            published: Math.floor(Date.now() / 1000),
+            publishedText: String(v.uploadedDate || ''),
+            lengthSeconds: Number(v.duration || 0),
+            liveNow: false,
+            is4k: /\b(4k|8k|2160p|uhd|hdr)\b/i.test(String(v.title || '')),
+            authorThumbnails: [],
+          };
+        }).filter((x: SearchVideoItem) => /^[a-zA-Z0-9_-]{6,20}$/.test(x.videoId));
+        return {
+          author: String(ch.name),
+          authorId: String(ch.id || channelId),
+          authorUrl: `/channel/${ch.id || channelId}`,
+          authorBanners: ch.bannerUrl ? [{ url: proxyMediaUrl(String(ch.bannerUrl)), width: 1280, height: 240 }] : [],
+          authorThumbnails: ch.avatarUrl ? [{ url: proxyMediaUrl(String(ch.avatarUrl)), width: 176, height: 176 }] : [],
+          subCount: Number(ch.subscriberCount || 0),
+          subCountText: ch.subscriberCount ? `${Number(ch.subscriberCount).toLocaleString()} subscribers` : '',
+          totalViews: 0,
+          joined: 0,
+          autoGenerated: false,
+          isFamilyFriendly: true,
+          description: String(ch.description || ''),
+          descriptionHtml: textToHtml(ch.description || ''),
+          latestVideos,
+        };
+      }),
+    ]);
   } catch {
     return null;
   }
+}
+
+function extractBalancedJsonObject(html: string, anchor: string): Record<string, unknown> | null {
+  const idx = html.indexOf(anchor);
+  if (idx < 0) return null;
+  const scanFrom = html.indexOf('{', idx);
+  if (scanFrom < 0) return null;
+  let depth = 0;
+  let inStr = false;
+  let esc = false;
+  let endIdx = -1;
+  for (let i = scanFrom; i < html.length; i++) {
+    const ch = html[i];
+    if (esc) { esc = false; continue; }
+    if (ch === '\\' && inStr) { esc = true; continue; }
+    if (ch === '"') { inStr = !inStr; continue; }
+    if (!inStr) {
+      if (ch === '{') depth++;
+      else if (ch === '}') {
+        depth--;
+        if (depth === 0) { endIdx = i + 1; break; }
+      }
+    }
+  }
+  if (endIdx <= scanFrom) return null;
+  try {
+    return JSON.parse(html.slice(scanFrom, endIdx)) as Record<string, unknown>;
+  } catch {
+    return null;
+  }
+}
+
+async function extractWatchPageRelatedVideos(videoId: string): Promise<RecommendedVideo[]> {
+  try {
+    const r = await proxiedFetch(`https://www.youtube.com/watch?v=${encodeURIComponent(videoId)}`, {
+      headers: { 'User-Agent': PRIVACY_USER_AGENTS[0], 'Accept-Language': 'ja,en-US;q=0.9,en;q=0.8' },
+      signal: AbortSignal.timeout(4500),
+    });
+    if (!r.ok) return [];
+    const html = await r.text();
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const data: any = extractBalancedJsonObject(html, 'var ytInitialData =') || extractBalancedJsonObject(html, 'ytInitialData =');
+    if (!data) return [];
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const results: any[] =
+      data?.contents?.twoColumnWatchNextResults?.secondaryResults?.secondaryResults?.results || [];
+    const recs: RecommendedVideo[] = [];
+    const seen = new Set<string>([videoId]);
+
+    for (const entry of results) {
+      const cvr = entry?.compactVideoRenderer;
+      if (cvr?.videoId && !seen.has(cvr.videoId)) {
+        seen.add(cvr.videoId);
+        const title = cvr.title?.simpleText || cvr.title?.runs?.map((x: { text?: string }) => x.text || '').join('') || 'Untitled Video';
+        const authorRun = cvr.longBylineText?.runs?.[0] || cvr.shortBylineText?.runs?.[0];
+        const author = authorRun?.text || 'YouTube Creator';
+        const authorId = authorRun?.navigationEndpoint?.browseEndpoint?.browseId || '';
+        const viewText = cvr.shortViewCountText?.simpleText || cvr.viewCountText?.simpleText || '';
+        const lengthText = cvr.lengthText?.simpleText || '';
+        recs.push({
+          videoId: String(cvr.videoId),
+          title: String(title),
+          videoThumbnails: buildThumbnails(String(cvr.videoId)),
+          author: String(author),
+          authorId: String(authorId),
+          lengthSeconds: parseDurationToSeconds(lengthText),
+          viewCountText: String(viewText || formatViewsLabel(parseViewCount(viewText))),
+          viewCount: parseViewCount(viewText),
+        });
+      }
+
+      const lvm = entry?.lockupViewModel;
+      if (lvm?.contentId && !seen.has(lvm.contentId) && /^[a-zA-Z0-9_-]{6,20}$/.test(lvm.contentId)) {
+        seen.add(lvm.contentId);
+        const title = lvm.metadata?.lockupMetadataViewModel?.title?.content || 'Untitled Video';
+        const rows = lvm.metadata?.lockupMetadataViewModel?.metadata?.contentMetadataViewModel?.metadataRows || [];
+        const author = rows[0]?.metadataParts?.[0]?.text?.content || 'YouTube Creator';
+        const viewText = rows[1]?.metadataParts?.[0]?.text?.content || '';
+        const authorId = lvm.metadata?.lockupMetadataViewModel?.image?.decoratedAvatarViewModel?.rendererContext?.commandContext?.onTap?.innertubeCommand?.browseEndpoint?.browseId || '';
+        const overlays = lvm.contentImage?.thumbnailViewModel?.overlays || [];
+        let durationText = '';
+        for (const ov of overlays) {
+          const b = ov?.thumbnailBottomOverlayViewModel?.badges?.[0]?.thumbnailBadgeViewModel?.text;
+          if (b && /\d+:\d+/.test(b)) { durationText = b; break; }
+        }
+        recs.push({
+          videoId: String(lvm.contentId),
+          title: String(title),
+          videoThumbnails: buildThumbnails(String(lvm.contentId)),
+          author: String(author),
+          authorId: String(authorId),
+          lengthSeconds: parseDurationToSeconds(durationText),
+          viewCountText: String(viewText || formatViewsLabel(parseViewCount(viewText))),
+          viewCount: parseViewCount(viewText),
+        });
+      }
+      if (recs.length >= 20) break;
+    }
+    return recs;
+  } catch {
+    return [];
+  }
+}
+
+async function fetchChannelFromYouTubeHtml(channelRef: string): Promise<ChannelResponse | null> {
+  try {
+    const cleanRef = channelRef.replace(/^\/+/, '').replace(/^https?:\/\/(www\.)?youtube\.com\//i, '');
+    const targetUrl = cleanRef.startsWith('UC')
+      ? `https://www.youtube.com/channel/${encodeURIComponent(cleanRef)}/videos`
+      : cleanRef.startsWith('@')
+        ? `https://www.youtube.com/${encodeURIComponent(cleanRef)}/videos`
+        : cleanRef.includes('/')
+          ? `https://www.youtube.com/${cleanRef}`
+          : `https://www.youtube.com/channel/${encodeURIComponent(cleanRef)}/videos`;
+
+    const r = await proxiedFetch(targetUrl, {
+      headers: { 'User-Agent': PRIVACY_USER_AGENTS[0], 'Accept-Language': 'ja,en-US;q=0.9,en;q=0.8' },
+      signal: AbortSignal.timeout(4800),
+    });
+    if (!r.ok) return null;
+    const html = await r.text();
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const data: any = extractBalancedJsonObject(html, 'var ytInitialData =') || extractBalancedJsonObject(html, 'ytInitialData =');
+    if (!data) return null;
+
+    const meta = data?.metadata?.channelMetadataRenderer || {};
+    const resolvedCid = String(
+      meta.externalId ||
+        data?.header?.c4TabbedHeaderRenderer?.channelId ||
+        html.match(/"channelId":"(UC[a-zA-Z0-9_-]{22})"/)?.[1] ||
+        cleanRef,
+    );
+    const author = String(
+      meta.title ||
+        data?.header?.pageHeaderRenderer?.pageTitle ||
+        data?.header?.c4TabbedHeaderRenderer?.title ||
+        'Channel',
+    );
+    const avatarRaw =
+      meta.avatar?.thumbnails?.[0]?.url ||
+      data?.header?.c4TabbedHeaderRenderer?.avatar?.thumbnails?.[0]?.url ||
+      data?.header?.pageHeaderRenderer?.content?.pageHeaderViewModel?.image?.decoratedAvatarViewModel?.avatar?.avatarViewModel?.image?.sources?.[0]?.url ||
+      '';
+    const bannerRaw =
+      data?.header?.c4TabbedHeaderRenderer?.banner?.thumbnails?.[0]?.url ||
+      data?.header?.pageHeaderRenderer?.content?.pageHeaderViewModel?.banner?.imageBannerViewModel?.image?.sources?.[0]?.url ||
+      '';
+    const subText = String(
+      data?.header?.c4TabbedHeaderRenderer?.subscriberCountText?.simpleText ||
+        data?.header?.pageHeaderRenderer?.content?.pageHeaderViewModel?.metadata?.contentMetadataViewModel?.metadataRows?.[1]?.metadataParts?.[0]?.text?.content ||
+        '',
+    );
+    const desc = String(meta.description || '');
+
+    const latestVideos: SearchVideoItem[] = [];
+    const seen = new Set<string>();
+    const tabs = data?.contents?.twoColumnBrowseResultsRenderer?.tabs || [];
+    for (const tab of tabs) {
+      const gridItems =
+        tab?.tabRenderer?.content?.richGridRenderer?.contents ||
+        tab?.tabRenderer?.content?.sectionListRenderer?.contents?.[0]?.itemSectionRenderer?.contents?.[0]?.gridRenderer?.items ||
+        [];
+      for (const item of gridItems) {
+        const lvm = item?.richItemRenderer?.content?.lockupViewModel;
+        if (lvm?.contentId && !seen.has(String(lvm.contentId))) {
+          seen.add(String(lvm.contentId));
+          const lvmTitle = lvm.metadata?.lockupMetadataViewModel?.title?.content || 'Untitled Video';
+          latestVideos.push({
+            type: 'video',
+            title: String(lvmTitle),
+            videoId: String(lvm.contentId),
+            author,
+            authorId: resolvedCid,
+            authorUrl: `/channel/${resolvedCid}`,
+            authorVerified: true,
+            videoThumbnails: buildThumbnails(String(lvm.contentId)),
+            description: '',
+            descriptionHtml: '',
+            viewCount: 0,
+            viewCountText: '',
+            published: Math.floor(Date.now() / 1000),
+            publishedText: '',
+            lengthSeconds: 0,
+            liveNow: false,
+            is4k: /\b(4k|8k|2160p|uhd|hdr)\b/i.test(String(lvmTitle)),
+            authorThumbnails: [],
+          });
+          if (latestVideos.length >= 24) break;
+          continue;
+        }
+        const vr =
+          item?.richItemRenderer?.content?.videoRenderer ||
+          item?.gridVideoRenderer ||
+          item?.videoRenderer;
+        if (!vr?.videoId || seen.has(vr.videoId)) continue;
+        seen.add(vr.videoId);
+        const title = vr.title?.runs?.[0]?.text || vr.title?.simpleText || 'Untitled Video';
+        const viewText = vr.shortViewCountText?.simpleText || vr.viewCountText?.simpleText || '';
+        const pubText = vr.publishedTimeText?.simpleText || '';
+        const durText = vr.lengthText?.simpleText || '';
+        latestVideos.push({
+          type: 'video',
+          title: String(title),
+          videoId: String(vr.videoId),
+          author,
+          authorId: resolvedCid,
+          authorUrl: `/channel/${resolvedCid}`,
+          authorVerified: true,
+          videoThumbnails: buildThumbnails(String(vr.videoId)),
+          description: '',
+          descriptionHtml: '',
+          viewCount: parseViewCount(viewText),
+          viewCountText: String(viewText || formatViewsLabel(parseViewCount(viewText))),
+          published: Math.floor(Date.now() / 1000),
+          publishedText: String(pubText),
+          lengthSeconds: parseDurationToSeconds(durText),
+          liveNow: false,
+          is4k: /\b(4k|8k|2160p|uhd|hdr)\b/i.test(String(title)),
+          authorThumbnails: [],
+        });
+        if (latestVideos.length >= 24) break;
+      }
+      if (latestVideos.length > 0) break;
+    }
+
+    if (!author && latestVideos.length === 0) return null;
+    return {
+      author,
+      authorId: resolvedCid,
+      authorUrl: `/channel/${resolvedCid}`,
+      authorBanners: bannerRaw ? [{ url: proxyMediaUrl(bannerRaw), width: 1280, height: 240 }] : [],
+      authorThumbnails: avatarRaw ? [{ url: proxyMediaUrl(avatarRaw), width: 176, height: 176 }] : [],
+      subCount: parseViewCount(subText),
+      subCountText: subText,
+      totalViews: 0,
+      joined: 0,
+      autoGenerated: false,
+      isFamilyFriendly: Boolean(meta.isFamilySafe ?? true),
+      description: desc,
+      descriptionHtml: textToHtml(desc),
+      latestVideos,
+    };
+  } catch {
+    return null;
+  }
+}
+
+async function fetchChannelFromRss(channelId: string): Promise<ChannelResponse | null> {
+  if (!/^UC[a-zA-Z0-9_-]{20,24}$/.test(channelId)) return null;
+  try {
+    const r = await proxiedFetch(`https://www.youtube.com/feeds/videos.xml?channel_id=${encodeURIComponent(channelId)}`, {
+      headers: { 'User-Agent': PRIVACY_USER_AGENTS[0] },
+      signal: AbortSignal.timeout(3500),
+    });
+    if (!r.ok) return null;
+    const xml = await r.text();
+    const chAuthor = xml.match(/<feed[\s\S]*?<author>\s*<name>([^<]+)<\/name>/)?.[1] || xml.match(/<title>([^<]+)<\/title>/)?.[1] || 'Channel';
+    const entries = xml.split('<entry>').slice(1);
+    const latestVideos: SearchVideoItem[] = [];
+    for (const ent of entries) {
+      const vid = ent.match(/<yt:videoId>([^<]+)<\/yt:videoId>/)?.[1] || '';
+      if (!/^[a-zA-Z0-9_-]{6,20}$/.test(vid)) continue;
+      const title = ent.match(/<title>([^<]+)<\/title>/)?.[1] || 'Untitled Video';
+      const pub = ent.match(/<published>([^<]+)<\/published>/)?.[1] || '';
+      const views = Number(ent.match(/views="(\d+)"/)?.[1] || 0);
+      const desc = ent.match(/<media:description>([\s\S]*?)<\/media:description>/)?.[1] || '';
+      latestVideos.push({
+        type: 'video',
+        title,
+        videoId: vid,
+        author: chAuthor,
+        authorId: channelId,
+        authorUrl: `/channel/${channelId}`,
+        authorVerified: true,
+        videoThumbnails: buildThumbnails(vid),
+        description: desc.slice(0, 300),
+        descriptionHtml: textToHtml(desc.slice(0, 300)),
+        viewCount: views,
+        viewCountText: formatViewsLabel(views),
+        published: pub ? Math.floor(new Date(pub).getTime() / 1000) : Math.floor(Date.now() / 1000),
+        publishedText: pub ? pub.slice(0, 10) : '',
+        lengthSeconds: 0,
+        liveNow: false,
+        is4k: /\b(4k|8k|2160p|uhd|hdr)\b/i.test(title),
+        authorThumbnails: [],
+      });
+      if (latestVideos.length >= 24) break;
+    }
+    if (latestVideos.length === 0) return null;
+    return {
+      author: chAuthor,
+      authorId: channelId,
+      authorUrl: `/channel/${channelId}`,
+      authorBanners: [],
+      authorThumbnails: [],
+      subCount: 0,
+      subCountText: '',
+      totalViews: 0,
+      joined: 0,
+      autoGenerated: false,
+      isFamilyFriendly: true,
+      description: '',
+      descriptionHtml: '',
+      latestVideos,
+    };
+  } catch {
+    return null;
+  }
+}
+
+async function fetchChannelFull(rawChannelId: string): Promise<{ data: ChannelResponse; source: string } | null> {
+  const cleanRef = rawChannelId.trim().replace(/^\/+/, '');
+  let targetChannelId = cleanRef;
+
+  const ytTask = (async (): Promise<{ data: ChannelResponse; source: string } | null> => {
+    try {
+      const yt = await getYt();
+      let cid = cleanRef;
+      if (cleanRef.startsWith('@') || cleanRef.startsWith('c/') || cleanRef.startsWith('user/')) {
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const resolved: any = await yt.resolveURL(`https://www.youtube.com/${cleanRef}`).catch(() => null);
+        if (resolved?.payload?.browseId) cid = String(resolved.payload.browseId);
+      }
+      targetChannelId = cid;
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const ch: any = await yt.getChannel(cid);
+      let rawVideos = Array.isArray(ch?.videos) ? ch.videos : [];
+      if (rawVideos.length === 0 && typeof ch?.getVideos === 'function') {
+        const vTab = await ch.getVideos().catch(() => null);
+        if (Array.isArray(vTab?.videos)) rawVideos = vTab.videos;
+      }
+      const latestVideos: SearchVideoItem[] = [];
+      for (const v of rawVideos) {
+        const mapped = mapRawVideoItem(v);
+        if (mapped) {
+          mapped.author = ch?.metadata?.title || mapped.author;
+          mapped.authorId = cid;
+          mapped.authorUrl = `/channel/${cid}`;
+          latestVideos.push(mapped);
+        }
+        if (latestVideos.length >= 24) break;
+      }
+      const avatar = ch?.metadata?.avatar?.[0]?.url || ch?.header?.author?.thumbnails?.[0]?.url || '';
+      const banner = ch?.header?.banner?.[0]?.url || '';
+      const subText = ch?.header?.subscribers?.text || '';
+      if (!ch?.metadata?.title && latestVideos.length === 0) return null;
+      return {
+        source: 'innertube-channel',
+        data: {
+          author: ch?.metadata?.title || 'Channel',
+          authorId: cid,
+          authorUrl: `/channel/${cid}`,
+          authorBanners: banner ? [{ url: proxyMediaUrl(banner), width: 1280, height: 240 }] : [],
+          authorThumbnails: avatar ? [{ url: proxyMediaUrl(avatar), width: 176, height: 176 }] : [],
+          subCount: parseViewCount(subText),
+          subCountText: subText,
+          totalViews: 0,
+          joined: 0,
+          autoGenerated: false,
+          isFamilyFriendly: Boolean(ch?.metadata?.is_family_safe ?? true),
+          description: ch?.metadata?.description || '',
+          descriptionHtml: textToHtml(ch?.metadata?.description || ''),
+          latestVideos,
+        },
+      };
+    } catch {
+      return null;
+    }
+  })();
+
+  const htmlTask = fetchChannelFromYouTubeHtml(cleanRef).then((d) =>
+    d ? { data: d, source: 'yt-channel-html' } : null,
+  );
+  const rssTask = /^UC[a-zA-Z0-9_-]{20,24}$/.test(cleanRef)
+    ? fetchChannelFromRss(cleanRef).then((d) => (d ? { data: d, source: 'yt-channel-rss' } : null))
+    : Promise.resolve(null);
+  const extTask = /^UC[a-zA-Z0-9_-]{20,24}$/.test(cleanRef)
+    ? fetchChannelViaExternalProxy(cleanRef).then((d) => (d ? { data: d, source: 'external-proxy-channel' } : null))
+    : Promise.resolve(null);
+
+  const [ytRes, htmlRes, rssRes, extRes] = await Promise.all([ytTask, htmlTask, rssTask, extTask]);
+  const candidates = [ytRes, htmlRes, rssRes, extRes].filter(
+    (c): c is { data: ChannelResponse; source: string } => Boolean(c && c.data),
+  );
+  const resolvedUc =
+    (/^UC[a-zA-Z0-9_-]{20,24}$/.test(targetChannelId) ? targetChannelId : '') ||
+    candidates.find((c) => /^UC[a-zA-Z0-9_-]{20,24}$/.test(c.data.authorId))?.data.authorId ||
+    '';
+
+  if (!candidates.some((c) => c.data.latestVideos.length > 0) && resolvedUc) {
+    const [rssRetry, extRetry] = await Promise.all([
+      fetchChannelFromRss(resolvedUc).catch(() => null),
+      fetchChannelViaExternalProxy(resolvedUc).catch(() => null),
+    ]);
+    if (rssRetry) candidates.push({ data: rssRetry, source: 'yt-channel-rss' });
+    if (extRetry) candidates.push({ data: extRetry, source: 'external-proxy-channel' });
+  }
+  if (candidates.length === 0) return null;
+
+  const withVideos = candidates.find((c) => c.data.latestVideos.length > 0) || candidates[0];
+  const merged: ChannelResponse = {
+    ...withVideos.data,
+    authorThumbnails: withVideos.data.authorThumbnails.length
+      ? withVideos.data.authorThumbnails
+      : candidates.find((c) => c.data.authorThumbnails.length > 0)?.data.authorThumbnails || [],
+    authorBanners: withVideos.data.authorBanners.length
+      ? withVideos.data.authorBanners
+      : candidates.find((c) => c.data.authorBanners.length > 0)?.data.authorBanners || [],
+    subCountText: withVideos.data.subCountText || candidates.find((c) => c.data.subCountText)?.data.subCountText || '',
+    description: withVideos.data.description || candidates.find((c) => c.data.description)?.data.description || '',
+  };
+  await hydrateBase64Thumbnails(merged.latestVideos, 'mqdefault');
+  return { data: merged, source: withVideos.source };
 }
 
 // Keep alias for compatibility with existing calls
@@ -1986,22 +2821,241 @@ async function fetchUpstreamMediaWithFailover(
   throw new Error('上流メディアストリームの取得に失敗しました');
 }
 
+function parseRequestedHeight(raw: unknown, fallback = 2160): number {
+  const s = String(raw || '').trim().toLowerCase();
+  if (!s) return fallback;
+  if (s === '4k' || s === 'uhd' || s === '2160' || s === '2160p') return 2160;
+  if (s === '2k' || s === 'qhd' || s === '1440' || s === '1440p') return 1440;
+  if (s === 'fhd' || s === '1080' || s === '1080p') return 1080;
+  if (s === 'hd' || s === '720' || s === '720p') return 720;
+  if (s === 'sd' || s === '480' || s === '480p') return 480;
+  if (s === '360' || s === '360p') return 360;
+  const n = parseInt(s, 10);
+  return Number.isFinite(n) && n > 0 ? n : fallback;
+}
+
+function parseByteRange(
+  rangeHeader: string,
+  totalSize?: number,
+): { start: number; end?: number } | null {
+  const m = /^bytes=(\d*)-(\d*)$/i.exec(rangeHeader.trim());
+  if (!m) return null;
+  if (m[1] === '' && m[2] !== '' && totalSize && totalSize > 0) {
+    const suffix = parseInt(m[2], 10);
+    return { start: Math.max(0, totalSize - suffix), end: totalSize - 1 };
+  }
+  const start = m[1] ? parseInt(m[1], 10) : 0;
+  const end = m[2] ? parseInt(m[2], 10) : undefined;
+  if (!Number.isFinite(start) || start < 0) return null;
+  if (end !== undefined && (!Number.isFinite(end) || end < start)) return null;
+  return { start, end };
+}
+
+async function fetchAndCacheChunk(
+  videoId: string,
+  itag: string,
+  chunkIdx: number,
+  primaryUrl: string,
+): Promise<CachedStreamChunk | null> {
+  const cached = getStreamChunkCached(videoId, itag, chunkIdx);
+  if (cached) return cached;
+
+  const flightKey = `${videoId}:${itag}:${chunkIdx}`;
+  const existing = streamChunkInFlight.get(flightKey);
+  if (existing) return existing;
+
+  const job = (async (): Promise<CachedStreamChunk | null> => {
+    const start = chunkIdx * STREAM_CHUNK_BYTES;
+    const end = start + STREAM_CHUNK_BYTES - 1;
+    try {
+      const cachedUrl = cacheGet<{ url: string }>(`stream:${videoId}:${itag}`).data?.url || primaryUrl;
+      const r = await fetchUpstreamMediaWithFailover(videoId, itag, cachedUrl, `bytes=${start}-${end}`);
+      if (!r.ok && r.status !== 206) return null;
+      const buf = Buffer.from(await r.arrayBuffer());
+      if (buf.length === 0) return null;
+
+      let totalSize = 0;
+      const cr = r.headers.get('content-range') || '';
+      const crMatch = /bytes\s+\d+-\d+\/(\d+)/i.exec(cr);
+      if (crMatch) {
+        totalSize = parseInt(crMatch[1], 10) || 0;
+      } else if (r.status === 200) {
+        const cl = parseInt(r.headers.get('content-length') || '0', 10);
+        if (cl > 0) totalSize = cl;
+      }
+      const ct = r.headers.get('content-type') || (itag === '140' ? 'audio/mp4' : 'video/mp4');
+      return setStreamChunkCached(videoId, itag, chunkIdx, buf, totalSize, ct);
+    } catch {
+      return null;
+    }
+  })().finally(() => {
+    streamChunkInFlight.delete(flightKey);
+  });
+
+  streamChunkInFlight.set(flightKey, job);
+  return job;
+}
+
+function prefetchChunksAhead(
+  videoId: string,
+  itag: string,
+  startChunkIdx: number,
+  count: number,
+  primaryUrl: string,
+): void {
+  const meta = streamMetaInfo.get(`${videoId}:${itag}`);
+  for (let i = 0; i < count; i++) {
+    const idx = startChunkIdx + i;
+    if (idx < 0) continue;
+    if (meta && meta.totalSize > 0 && idx * STREAM_CHUNK_BYTES >= meta.totalSize) break;
+    if (getStreamChunkCached(videoId, itag, idx)) continue;
+    fetchAndCacheChunk(videoId, itag, idx, primaryUrl).catch(() => null);
+  }
+}
+
+async function streamFastServer1Response(
+  videoId: string,
+  itag: string,
+  primaryUrl: string,
+  req: express.Request,
+  res: express.Response,
+): Promise<void> {
+  res.socket?.setNoDelay?.(true);
+  const rangeHeader = typeof req.headers.range === 'string' ? req.headers.range : undefined;
+  const meta = streamMetaInfo.get(`${videoId}:${itag}`);
+
+  if (rangeHeader) {
+    const parsed = parseByteRange(rangeHeader, meta?.totalSize);
+    if (parsed) {
+      const start = parsed.start;
+      const requestedEnd =
+        parsed.end !== undefined
+          ? parsed.end
+          : meta?.totalSize
+            ? Math.min(meta.totalSize - 1, start + STREAM_CHUNK_BYTES * 2 - 1)
+            : start + STREAM_CHUNK_BYTES - 1;
+      const span = requestedEnd - start + 1;
+
+      if (span > 0 && span <= STREAM_CHUNK_BYTES * 2) {
+        const startChunk = Math.floor(start / STREAM_CHUNK_BYTES);
+        const endChunk = Math.floor(requestedEnd / STREAM_CHUNK_BYTES);
+        const indices: number[] = [];
+        for (let idx = startChunk; idx <= endChunk; idx++) indices.push(idx);
+
+        const allInRam = indices.every((idx) => Boolean(getStreamChunkCached(videoId, itag, idx)));
+        const chunks = await Promise.all(
+          indices.map((idx) => fetchAndCacheChunk(videoId, itag, idx, primaryUrl)),
+        );
+
+        if (chunks.every((c): c is CachedStreamChunk => Boolean(c))) {
+          const combined = Buffer.concat(chunks.map((c) => c.buf));
+          const baseOffset = startChunk * STREAM_CHUNK_BYTES;
+          const relStart = Math.max(0, start - baseOffset);
+          const relEnd = Math.min(combined.length, requestedEnd - baseOffset + 1);
+          const slice = combined.subarray(relStart, relEnd);
+          const firstMeta = chunks[0];
+          const totalSize = firstMeta.totalSize || streamMetaInfo.get(`${videoId}:${itag}`)?.totalSize || baseOffset + combined.length;
+          const actualEnd = start + slice.length - 1;
+
+          res.status(206);
+          res.setHeader('Content-Type', firstMeta.contentType || 'video/mp4');
+          res.setHeader('Accept-Ranges', 'bytes');
+          res.setHeader('Content-Range', `bytes ${start}-${actualEnd}/${totalSize}`);
+          res.setHeader('Content-Length', String(slice.length));
+          res.setHeader('X-Stream-Mode', 'ultra-fast-ram-chunk');
+          res.setHeader('X-Stream-Cache', allInRam ? 'RAM-HIT' : 'RAM-WARM');
+          res.setHeader('X-Googlevideo-Itag', itag);
+          res.end(slice);
+
+          prefetchChunksAhead(videoId, itag, endChunk + 1, 3, primaryUrl);
+          return;
+        }
+      }
+    }
+  }
+
+  const upstream = await fetchUpstreamMediaWithFailover(videoId, itag, primaryUrl, rangeHeader);
+  if (res.headersSent) return;
+  res.status(upstream.status);
+  const ct = upstream.headers.get('content-type') || (itag === '140' ? 'audio/mp4' : 'video/mp4');
+  res.setHeader('Content-Type', ct);
+  res.setHeader('Accept-Ranges', upstream.headers.get('accept-ranges') || 'bytes');
+  res.setHeader('X-Stream-Mode', 'ultra-fast-edge-pipe');
+  res.setHeader('X-Stream-Cache', 'EDGE-MISS');
+  res.setHeader('X-Googlevideo-Itag', itag);
+  const cl = upstream.headers.get('content-length');
+  const cr = upstream.headers.get('content-range');
+  if (cl) res.setHeader('Content-Length', cl);
+  if (cr) res.setHeader('Content-Range', cr);
+
+  if (!upstream.body) {
+    res.end();
+    return;
+  }
+
+  const shouldTeeFromZero = !rangeHeader || rangeHeader.startsWith('bytes=0-');
+  const totalKnown = cl && !cr ? parseInt(cl, 10) || 0 : 0;
+  let teeCursor = 0;
+  let teeChunkIdx = 0;
+  let teeAcc: Buffer[] = [];
+  let teeBytes = 0;
+  const MAX_TEE_BYTES = STREAM_CHUNK_BYTES * 4;
+
+  const reader = upstream.body.getReader();
+  res.on('close', () => {
+    if (!res.writableEnded) reader.cancel().catch(() => {});
+  });
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    const chunkBuf = Buffer.from(value);
+    if (!res.writableEnded) res.write(chunkBuf);
+
+    if (shouldTeeFromZero && teeCursor < MAX_TEE_BYTES) {
+      teeAcc.push(chunkBuf);
+      teeBytes += chunkBuf.length;
+      teeCursor += chunkBuf.length;
+      if (teeBytes >= STREAM_CHUNK_BYTES) {
+        const merged = Buffer.concat(teeAcc);
+        let pos = 0;
+        while (pos + STREAM_CHUNK_BYTES <= merged.length && teeChunkIdx < 4) {
+          setStreamChunkCached(
+            videoId,
+            itag,
+            teeChunkIdx++,
+            merged.subarray(pos, pos + STREAM_CHUNK_BYTES),
+            totalKnown,
+            ct,
+          );
+          pos += STREAM_CHUNK_BYTES;
+        }
+        const rem = merged.subarray(pos);
+        teeAcc = rem.length ? [rem] : [];
+        teeBytes = rem.length;
+      }
+    }
+  }
+  res.end();
+}
+
 // ---------------------------------------------------------------------------
 // Core Video Extractor (Companion+PokeTube + InnerTube + External Proxy + oEmbed)
 // ---------------------------------------------------------------------------
 async function fetchVideoFull(videoId: string): Promise<VideoResponse> {
   const ytPromiseLocal = getYt().catch(() => null);
 
-  const [infoResult, oembedResult, externalProxyResult, directStreamResult, companionResult] = await Promise.allSettled([
-    ytPromiseLocal.then((yt) => (yt ? yt.getInfo(videoId) : null)),
-    proxiedFetch(
-      `https://www.youtube.com/oembed?url=https://www.youtube.com/watch?v=${encodeURIComponent(videoId)}&format=json`,
-      { headers: { 'User-Agent': PRIVACY_USER_AGENTS[0] }, signal: AbortSignal.timeout(2800) },
-    ).then((r) => (r.ok ? r.json() : null)),
-    fetchVideoViaExternalProxy(videoId),
-    ytPromiseLocal.then((yt) => (yt ? extractDirectInnertubeStreams(yt, videoId) : null)),
-    extractCompanionAndPoketubeStreams(videoId),
-  ]);
+  const [infoResult, oembedResult, externalProxyResult, directStreamResult, companionResult, watchRelatedResult] =
+    await Promise.allSettled([
+      ytPromiseLocal.then((yt) => (yt ? yt.getInfo(videoId) : null)),
+      proxiedFetch(
+        `https://www.youtube.com/oembed?url=https://www.youtube.com/watch?v=${encodeURIComponent(videoId)}&format=json`,
+        { headers: { 'User-Agent': PRIVACY_USER_AGENTS[0] }, signal: AbortSignal.timeout(2600) },
+      ).then((r) => (r.ok ? r.json() : null)),
+      fetchVideoViaExternalProxy(videoId),
+      ytPromiseLocal.then((yt) => (yt ? extractDirectInnertubeStreams(yt, videoId) : null)),
+      extractCompanionAndPoketubeStreams(videoId),
+      extractWatchPageRelatedVideos(videoId),
+    ]);
 
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const info: any = infoResult.status === 'fulfilled' ? infoResult.value : null;
@@ -2010,6 +3064,7 @@ async function fetchVideoFull(videoId: string): Promise<VideoResponse> {
   const raceData = externalProxyResult.status === 'fulfilled' ? externalProxyResult.value : null;
   const directData = directStreamResult.status === 'fulfilled' ? directStreamResult.value : null;
   const companionData = companionResult.status === 'fulfilled' ? companionResult.value : null;
+  const watchPageRel = watchRelatedResult.status === 'fulfilled' ? watchRelatedResult.value : [];
 
   const title =
     info?.primary_info?.title?.text ||
@@ -2059,15 +3114,21 @@ async function fetchVideoFull(videoId: string): Promise<VideoResponse> {
     raceData?.description ||
     '';
 
-  // Extract recommended videos from watch_next_feed (LockupView) OR external proxy node
+  // Extract recommended videos: watch_next_feed + Watch HTML ytInitialData + external proxy + search fallback
   const recommendedRaw = Array.isArray(info?.watch_next_feed) ? info.watch_next_feed : [];
   const recommendedVideos: RecommendedVideo[] = [];
   const seenRecIds = new Set<string>([videoId]);
+
+  const pushRec = (r: RecommendedVideo | null) => {
+    if (!r || !r.videoId || seenRecIds.has(r.videoId)) return;
+    seenRecIds.add(r.videoId);
+    recommendedVideos.push(r);
+  };
+
   for (const item of recommendedRaw) {
     const mapped = mapRawVideoItem(item);
-    if (mapped && !seenRecIds.has(mapped.videoId)) {
-      seenRecIds.add(mapped.videoId);
-      recommendedVideos.push({
+    if (mapped) {
+      pushRec({
         videoId: mapped.videoId,
         title: mapped.title,
         videoThumbnails: mapped.videoThumbnails,
@@ -2078,19 +3139,21 @@ async function fetchVideoFull(videoId: string): Promise<VideoResponse> {
         viewCount: mapped.viewCount,
       });
     }
-    if (recommendedVideos.length >= 20) break;
+    if (recommendedVideos.length >= 24) break;
+  }
+
+  for (const r of watchPageRel) {
+    pushRec(r);
+    if (recommendedVideos.length >= 24) break;
   }
 
   for (const r of raceData?.recommendedVideos || []) {
-    if (!seenRecIds.has(r.videoId)) {
-      seenRecIds.add(r.videoId);
-      recommendedVideos.push(r);
-    }
-    if (recommendedVideos.length >= 20) break;
+    pushRec(r);
+    if (recommendedVideos.length >= 24) break;
   }
 
-  // Fallback search for related videos via proxy/InnerTube if fewer than 8
-  if (recommendedVideos.length < 8) {
+  // Fallback search for related videos via proxy/InnerTube if fewer than 10
+  if (recommendedVideos.length < 10) {
     const fallbackQuery =
       (title && !title.startsWith('Video ') ? title.slice(0, 60) : '') ||
       (author && author !== 'YouTube Creator' ? author : '4K HDR Japan');
@@ -2100,9 +3163,8 @@ async function fetchVideoFull(videoId: string): Promise<VideoResponse> {
       : null;
     for (const v of relSearch?.videos || []) {
       const mapped = mapRawVideoItem(v);
-      if (mapped && !seenRecIds.has(mapped.videoId)) {
-        seenRecIds.add(mapped.videoId);
-        recommendedVideos.push({
+      if (mapped) {
+        pushRec({
           videoId: mapped.videoId,
           title: mapped.title,
           videoThumbnails: mapped.videoThumbnails,
@@ -2113,25 +3175,22 @@ async function fetchVideoFull(videoId: string): Promise<VideoResponse> {
           viewCount: mapped.viewCount,
         });
       }
-      if (recommendedVideos.length >= 20) break;
+      if (recommendedVideos.length >= 24) break;
     }
-    if (recommendedVideos.length < 8) {
+    if (recommendedVideos.length < 10) {
       const proxyRel = await searchViaExternalProxy(fallbackQuery, 'video', 'relevance');
       for (const mapped of proxyRel) {
-        if (!seenRecIds.has(mapped.videoId)) {
-          seenRecIds.add(mapped.videoId);
-          recommendedVideos.push({
-            videoId: mapped.videoId,
-            title: mapped.title,
-            videoThumbnails: mapped.videoThumbnails,
-            author: mapped.author,
-            authorId: mapped.authorId,
-            lengthSeconds: mapped.lengthSeconds,
-            viewCountText: mapped.viewCountText,
-            viewCount: mapped.viewCount,
-          });
-        }
-        if (recommendedVideos.length >= 20) break;
+        pushRec({
+          videoId: mapped.videoId,
+          title: mapped.title,
+          videoThumbnails: mapped.videoThumbnails,
+          author: mapped.author,
+          authorId: mapped.authorId,
+          lengthSeconds: mapped.lengthSeconds,
+          viewCountText: mapped.viewCountText,
+          viewCount: mapped.viewCount,
+        });
+        if (recommendedVideos.length >= 24) break;
       }
     }
   }
@@ -2245,11 +3304,22 @@ async function fetchVideoFull(videoId: string): Promise<VideoResponse> {
       ? `/api/v1/stream/googlevideo/${encodeURIComponent(videoId)}?itag=${encodeURIComponent(defaultProgItag)}`
       : undefined;
 
+  const [mainThumb] = await Promise.all([
+    fetchThumbnailBase64(videoId, 'maxresdefault').catch(() => null),
+    hydrateBase64Thumbnails(recommendedVideos, 'mqdefault'),
+  ]);
+
+  if (hasDirectStreams) {
+    const prewarmUrl = formatStreams[0]?.url || companionStreamUrl(videoId, '18');
+    prefetchChunksAhead(videoId, formatStreams[0]?.itag || '18', 0, 2, prewarmUrl);
+  }
+
   return {
     type: 'video',
     title,
     videoId,
-    videoThumbnails: buildThumbnails(videoId),
+    videoThumbnails: buildThumbnails(videoId, mainThumb?.dataUri),
+    thumbnailBase64: mainThumb?.dataUri,
     description,
     descriptionHtml: textToHtml(description),
     published: Math.floor(Date.now() / 1000),
@@ -2696,6 +3766,7 @@ async function startServer(): Promise<void> {
         usedSource = 'external-proxy-search';
       }
 
+      await hydrateBase64Thumbnails(items, 'mqdefault');
       cacheSet(cacheKey, items, 180_000, usedSource);
       res.setHeader('X-Cache', 'MISS');
       res.setHeader('X-Upstream-Node', usedSource);
@@ -2758,12 +3829,45 @@ async function startServer(): Promise<void> {
         usedSource = 'external-proxy-feed';
       }
 
+      await hydrateBase64Thumbnails(items, 'mqdefault');
       cacheSet(cacheKey, items, 300_000, usedSource);
       res.setHeader('X-Cache', 'MISS');
       res.setHeader('X-Upstream-Node', usedSource);
       res.json(items);
     } catch (err) {
       res.status(502).json({ error: err instanceof Error ? err.message : 'Trending feed failed' });
+    }
+  });
+
+  // 6b. GET /api/v1/related/:id (Dedicated Related Videos with Base64 thumbnails)
+  app.get('/api/v1/related/:id', async (req, res) => {
+    const videoId = String(req.params.id || '').trim();
+    if (!/^[a-zA-Z0-9_-]{6,20}$/.test(videoId)) {
+      res.status(400).json({ error: 'Invalid YouTube video ID' });
+      return;
+    }
+    try {
+      const cached = cacheGet<VideoResponse>(`video:${videoId}`);
+      if (cached.hit && !cached.stale && cached.data?.recommendedVideos?.length) {
+        res.setHeader('X-Cache', 'HIT');
+        res.json({
+          videoId,
+          count: cached.data.recommendedVideos.length,
+          recommendedVideos: cached.data.recommendedVideos,
+        });
+        return;
+      }
+      const [watchRel, video] = await Promise.all([
+        extractWatchPageRelatedVideos(videoId).catch(() => []),
+        fetchVideoFull(videoId).catch(() => null),
+      ]);
+      const list = video?.recommendedVideos?.length ? video.recommendedVideos : watchRel;
+      await hydrateBase64Thumbnails(list, 'mqdefault');
+      if (video) cacheSet(`video:${videoId}`, video, 300_000, video.upstreamSource || 'innertube-edge');
+      res.setHeader('X-Cache', 'MISS');
+      res.json({ videoId, count: list.length, recommendedVideos: list });
+    } catch (err) {
+      res.status(502).json({ error: err instanceof Error ? err.message : 'Related videos lookup failed' });
     }
   });
 
@@ -2877,146 +3981,93 @@ async function startServer(): Promise<void> {
     }
   });
 
-  // 9. GET /api/v1/channels/:id
+  // 9. GET /api/v1/channels/:id (Supports UC..., @handle, custom slug via HTML + RSS + InnerTube + External Proxy)
   app.get('/api/v1/channels/:id', async (req, res) => {
-    const channelId = String(req.params.id || '').trim();
+    const channelId = decodeURIComponent(String(req.params.id || '')).trim();
+    const refresh = req.query.refresh === 'true';
     if (!channelId) {
-      res.status(400).json({ error: 'Channel ID required' });
+      res.status(400).json({ error: 'Channel ID or @handle required' });
       return;
     }
 
     const cacheKey = `channel:${channelId}`;
-    const cached = cacheGet<ChannelResponse>(cacheKey);
-    if (cached.hit && !cached.stale && cached.data) {
-      metrics.hits += 1;
-      res.setHeader('X-Cache', 'HIT');
-      res.setHeader('X-Upstream-Node', cached.source || 'l1-cache');
-      res.json(cached.data);
-      return;
+    if (!refresh) {
+      const cached = cacheGet<ChannelResponse>(cacheKey);
+      if (cached.hit && !cached.stale && cached.data) {
+        metrics.hits += 1;
+        res.setHeader('X-Cache', 'HIT');
+        res.setHeader('X-Upstream-Node', cached.source || 'l1-cache');
+        res.json(cached.data);
+        return;
+      }
     }
 
     metrics.misses += 1;
     try {
-      let payload: ChannelResponse | null = null;
-      let usedSource = 'innertube-channel';
-      try {
-        const yt = await getYt();
-        // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        const ch: any = await yt.getChannel(channelId);
-        const latestVideos: SearchVideoItem[] = [];
-        for (const v of ch?.videos || []) {
-          const mapped = mapRawVideoItem(v);
-          if (mapped) latestVideos.push(mapped);
-          if (latestVideos.length >= 24) break;
-        }
-        const avatar = ch?.metadata?.avatar?.[0]?.url || ch?.header?.author?.thumbnails?.[0]?.url || '';
-        const banner = ch?.header?.banner?.[0]?.url || '';
-        const subText = ch?.header?.subscribers?.text || '';
-        payload = {
-          author: ch?.metadata?.title || 'Channel',
-          authorId: channelId,
-          authorUrl: `/channel/${channelId}`,
-          authorBanners: banner ? [{ url: proxyMediaUrl(banner), width: 1280, height: 240 }] : [],
-          authorThumbnails: avatar ? [{ url: proxyMediaUrl(avatar), width: 176, height: 176 }] : [],
-          subCount: parseViewCount(subText),
-          subCountText: subText,
-          totalViews: 0,
-          joined: 0,
-          autoGenerated: false,
-          isFamilyFriendly: Boolean(ch?.metadata?.is_family_safe ?? true),
-          description: ch?.metadata?.description || '',
-          descriptionHtml: textToHtml(ch?.metadata?.description || ''),
-          latestVideos,
-        };
-      } catch {
-        // fallback below
-      }
-
-      if (!payload || payload.latestVideos.length === 0) {
-        const extCh = await fetchChannelViaExternalProxy(channelId);
-        if (extCh) {
-          payload = extCh;
-          usedSource = 'external-proxy-channel';
-        }
-      }
-
-      if (!payload) {
-        res.status(502).json({ error: 'Channel lookup failed across all proxy nodes' });
+      const result = await fetchChannelFull(channelId);
+      if (!result) {
+        res.status(404).json({ error: '指定されたチャンネルが見つかりませんでした (UC... または @handle を指定してください)' });
         return;
       }
 
-      cacheSet(cacheKey, payload, 300_000, usedSource);
+      cacheSet(cacheKey, result.data, 300_000, result.source);
+      if (result.data.authorId && result.data.authorId !== channelId) {
+        cacheSet(`channel:${result.data.authorId}`, result.data, 300_000, result.source);
+      }
       res.setHeader('X-Cache', 'MISS');
-      res.setHeader('X-Upstream-Node', usedSource);
-      res.json(payload);
+      res.setHeader('X-Upstream-Node', result.source);
+      res.json(result.data);
     } catch (err) {
       res.status(502).json({ error: err instanceof Error ? err.message : 'Channel lookup failed' });
     }
   });
 
-  // 10. GET /api/v1/thumbnail/:id/:quality (Cached Proxy with Invidious/ytimg multi-relay fallback)
+  // 10. GET /api/v1/thumbnail/:id/:quality (Base64 JSON via ?format=base64 or Binary JPEG with multi-relay fallback)
+  app.get('/api/v1/thumbnail/:id/:quality/base64', async (req, res) => {
+    const videoId = String(req.params.id || '').replace(/[^a-zA-Z0-9_-]/g, '');
+    const requested = String(req.params.quality || 'maxresdefault').replace(/[^a-zA-Z0-9_-]/g, '');
+    const thumb = await fetchThumbnailBase64(videoId, requested);
+    if (!thumb) {
+      res.status(404).json({ error: 'Thumbnail not found' });
+      return;
+    }
+    res.setHeader('Cache-Control', 'public, max-age=86400');
+    res.json({
+      videoId,
+      quality: requested,
+      mimeType: 'image/jpeg',
+      base64: thumb.base64,
+      dataUri: thumb.dataUri,
+    });
+  });
+
   app.get('/api/v1/thumbnail/:id/:quality', async (req, res) => {
     const videoId = String(req.params.id || '').replace(/[^a-zA-Z0-9_-]/g, '');
     const requested = String(req.params.quality || 'maxresdefault').replace(/[^a-zA-Z0-9_-]/g, '');
-    const thumbCacheKey = `thumb:${videoId}:${requested}`;
-    const cachedThumb = cacheGet<Buffer>(thumbCacheKey);
-    if (cachedThumb.hit && cachedThumb.data) {
-      res.setHeader('Content-Type', 'image/jpeg');
-      res.setHeader('X-Cache', 'HIT');
-      res.setHeader('Cache-Control', 'public, max-age=86400, immutable');
-      res.send(cachedThumb.data);
+    const wantBase64 =
+      req.query.format === 'base64' || req.query.base64 === '1' || req.query.base64 === 'true';
+
+    const thumb = await fetchThumbnailBase64(videoId, requested);
+    if (!thumb) {
+      res.status(404).end();
       return;
     }
 
-    const order =
-      requested === 'maxresdefault'
-        ? ['maxresdefault', 'sddefault', 'hqdefault']
-        : requested === 'sddefault'
-          ? ['sddefault', 'hqdefault', 'mqdefault']
-          : [requested, 'hqdefault'];
-
-    for (const q of order) {
-      try {
-        const upstream = await proxiedFetch(`https://i.ytimg.com/vi/${videoId}/${q}.jpg`, {
-          headers: { 'User-Agent': PRIVACY_USER_AGENTS[0] },
-          signal: AbortSignal.timeout(2600),
-        });
-        if (upstream.ok) {
-          const buf = Buffer.from(await upstream.arrayBuffer());
-          cacheSet(thumbCacheKey, buf, 1_800_000, 'ytimg-proxy');
-          res.setHeader('Content-Type', 'image/jpeg');
-          res.setHeader('Cache-Control', 'public, max-age=86400, immutable');
-          res.send(buf);
-          return;
-        }
-      } catch {
-        // try next fallback quality or Invidious mirror
-      }
+    if (wantBase64) {
+      res.setHeader('Cache-Control', 'public, max-age=86400');
+      res.json({
+        videoId,
+        quality: requested,
+        mimeType: 'image/jpeg',
+        base64: thumb.base64,
+        dataUri: thumb.dataUri,
+      });
+      return;
     }
 
-    const invMirrors = getRankedExternalCandidates(
-      'invidious',
-      FALLBACK_INVIDIOUS_HOSTS.slice(0, 3).map((h) => `https://${h}`),
-    ).slice(0, 2);
-    for (const host of invMirrors) {
-      try {
-        const upstream = await proxiedFetch(`${host}/vi/${videoId}/hqdefault.jpg`, {
-          headers: { 'User-Agent': PRIVACY_USER_AGENTS[0] },
-          signal: AbortSignal.timeout(2500),
-        });
-        if (upstream.ok) {
-          const buf = Buffer.from(await upstream.arrayBuffer());
-          cacheSet(thumbCacheKey, buf, 1_800_000, 'invidious-thumb-proxy');
-          res.setHeader('Content-Type', 'image/jpeg');
-          res.setHeader('Cache-Control', 'public, max-age=86400, immutable');
-          res.send(buf);
-          return;
-        }
-      } catch {
-        // continue
-      }
-    }
-    res.status(404).end();
+    res.setHeader('Content-Type', 'image/jpeg');
+    res.setHeader('Cache-Control', 'public, max-age=86400, immutable');
+    res.send(thumb.buf);
   });
 
   // 10b. GET /api/v1/media-proxy (SSRF-safe YouTube/Invidious Avatar & Banner Image Proxy)
@@ -3118,7 +4169,7 @@ async function startServer(): Promise<void> {
     }
   });
 
-  // 11. GET /latest_version (Ultra-stable self-healing Range stream proxy with upstream failover)
+  // 11. GET /latest_version (Ultra-fast RAM-cached Range stream proxy with upstream failover)
   app.get('/latest_version', async (req, res) => {
     const id = String(req.query.id || '').trim();
     const itag = String(req.query.itag || '18').trim();
@@ -3127,44 +4178,12 @@ async function startServer(): Promise<void> {
       return;
     }
 
-    let cached = cacheGet<{ url: string; type: string }>(`stream:${id}:${itag}`);
-    if (!cached.hit || !cached.data?.url) {
-      try {
-        await fetchVideoFull(id);
-        cached = cacheGet<{ url: string; type: string }>(`stream:${id}:${itag}`);
-      } catch {
-        // ignore, failover handles companion direct URL
-      }
-    }
+    const cached = cacheGet<{ url: string; type: string }>(`stream:${id}:${itag}`);
     const targetUrl = cached.data?.url || companionStreamUrl(id, itag);
+    if (!cached.hit) ensureVideoCached(id, false).catch(() => {});
 
     try {
-      const upstream = await fetchUpstreamMediaWithFailover(id, itag, targetUrl, req.headers.range);
-
-      res.status(upstream.status);
-      const ct = upstream.headers.get('content-type') || (itag === '140' ? 'audio/mp4' : itag === '251' ? 'audio/webm' : 'video/mp4');
-      const cl = upstream.headers.get('content-length');
-      const cr = upstream.headers.get('content-range');
-      const ar = upstream.headers.get('accept-ranges') || 'bytes';
-      res.setHeader('Content-Type', ct);
-      res.setHeader('Accept-Ranges', ar);
-      if (cl) res.setHeader('Content-Length', cl);
-      if (cr) res.setHeader('Content-Range', cr);
-
-      if (!upstream.body) {
-        res.end();
-        return;
-      }
-      const reader = upstream.body.getReader();
-      res.on('close', () => {
-        if (!res.writableEnded) reader.cancel().catch(() => {});
-      });
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        if (!res.writableEnded) res.write(Buffer.from(value));
-      }
-      res.end();
+      await streamFastServer1Response(id, itag, targetUrl, req, res);
     } catch (err) {
       if (!res.headersSent) {
         res.status(502).json({ error: err instanceof Error ? err.message : 'Stream proxy error' });
@@ -3172,14 +4191,25 @@ async function startServer(): Promise<void> {
     }
   });
 
-  // Helper: Stream FFmpeg-muxed HD/1080p/4K MP4 cleanly with first-byte verification + progressive fallback
+  // Helper: Stream FFmpeg-muxed HD/1080p/1440p/2160p 4K MP4 or WebM cleanly with fast-start + codec selection
   async function streamMuxedMp4Response(
     videoId: string,
     res: express.Response,
-    opts: { maxHeight?: number; seekSec?: number; vItag?: string; aItag?: string; rangeHeader?: string } = {},
+    opts: {
+      maxHeight?: number;
+      seekSec?: number;
+      vItag?: string;
+      aItag?: string;
+      rangeHeader?: string;
+      codecPref?: string;
+      formatPref?: string;
+    } = {},
   ): Promise<void> {
     const maxHeight = opts.maxHeight || 2160;
     const seekSec = Math.max(0, Number(opts.seekSec || 0) || 0);
+    const codecPref = String(opts.codecPref || 'auto').toLowerCase();
+    const formatPref = String(opts.formatPref || 'mp4').toLowerCase();
+
     let video = cacheGet<VideoResponse>(`video:${videoId}`).data;
     if (!video || (!video.adaptiveFormats?.length && !video.formatStreams?.length)) {
       video = await fetchVideoFull(videoId).catch(() => undefined);
@@ -3192,27 +4222,59 @@ async function startServer(): Promise<void> {
         const hA = parseInt(a.qualityLabel || '0', 10) || 0;
         const hB = parseInt(b.qualityLabel || '0', 10) || 0;
         if (hB !== hA) return hB - hA;
-        // Prefer H.264 (avc1) for universal MP4 browser compatibility at equal resolution
-        const aH264 = /avc1/i.test(a.type + a.encoding) ? 1 : 0;
-        const bH264 = /avc1/i.test(b.type + b.encoding) ? 1 : 0;
-        if (bH264 !== aH264) return bH264 - aH264;
-        return (Number(b.bitrate) || 0) - (Number(a.bitrate) || 0);
-      });
-    const aTracks = (video?.adaptiveFormats || [])
-      .filter((f) => f.type.startsWith('audio/') && f.url)
-      .sort((a, b) => {
-        const aAac = /mp4a/i.test(a.type + a.encoding) ? 1 : 0;
-        const bAac = /mp4a/i.test(b.type + b.encoding) ? 1 : 0;
-        if (bAac !== aAac) return bAac - aAac;
+        const fpsDiff = (b.fps || 30) - (a.fps || 30);
+        if (fpsDiff !== 0) return fpsDiff;
+        const scoreCodec = (f: AdaptiveFormat) => {
+          const s = (f.type + f.encoding).toLowerCase();
+          if (codecPref === 'vp9' || formatPref === 'webm') return /vp0?9/i.test(s) ? 3 : /av01/i.test(s) ? 2 : 1;
+          if (codecPref === 'av1') return /av01/i.test(s) ? 3 : /avc1/i.test(s) ? 2 : 1;
+          return /avc1/i.test(s) ? 3 : /av01/i.test(s) ? 2 : 1;
+        };
+        const cDiff = scoreCodec(b) - scoreCodec(a);
+        if (cDiff !== 0) return cDiff;
         return (Number(b.bitrate) || 0) - (Number(a.bitrate) || 0);
       });
 
-    const vPicked =
-      (opts.vItag ? vTracks.find((v) => v.itag === opts.vItag) : null) ||
-      vTracks.find((v) => (parseInt(v.qualityLabel || '0', 10) || 0) <= maxHeight && /avc1/i.test(v.type + v.encoding)) ||
-      vTracks.find((v) => (parseInt(v.qualityLabel || '0', 10) || 0) <= maxHeight) ||
-      vTracks[0] ||
-      null;
+    const wantWebm = formatPref === 'webm';
+    const aTracks = (video?.adaptiveFormats || [])
+      .filter((f) => f.type.startsWith('audio/') && f.url)
+      .sort((a, b) => {
+        const aPref = wantWebm
+          ? /opus/i.test(a.type + a.encoding) ? 1 : 0
+          : /mp4a/i.test(a.type + a.encoding) ? 1 : 0;
+        const bPref = wantWebm
+          ? /opus/i.test(b.type + b.encoding) ? 1 : 0
+          : /mp4a/i.test(b.type + b.encoding) ? 1 : 0;
+        if (bPref !== aPref) return bPref - aPref;
+        return (Number(b.bitrate) || 0) - (Number(a.bitrate) || 0);
+      });
+
+    const eligibleV = vTracks.filter((v) => (parseInt(v.qualityLabel || '0', 10) || 0) <= maxHeight);
+    let vPicked: AdaptiveFormat | null = null;
+    if (opts.vItag) {
+      vPicked = vTracks.find((v) => v.itag === opts.vItag) || null;
+    }
+    if (!vPicked && codecPref === 'h264') {
+      vPicked = eligibleV.find((v) => /avc1/i.test(v.type + v.encoding)) || null;
+    } else if (!vPicked && (codecPref === 'vp9' || wantWebm)) {
+      vPicked = eligibleV.find((v) => /vp0?9/i.test(v.type + v.encoding)) || null;
+    } else if (!vPicked && codecPref === 'av1') {
+      vPicked = eligibleV.find((v) => /av01/i.test(v.type + v.encoding)) || null;
+    }
+    if (!vPicked) {
+      // At 1440p/2160p+, pick highest resolution track first (so true 4K VP9/AV1 plays instead of capping at 1080p H264);
+      // At <=1080p, prefer H.264 if at the same max height >=720p, else highest eligible track.
+      if (maxHeight >= 1440) {
+        vPicked = eligibleV[0] || vTracks[0] || null;
+      } else {
+        vPicked =
+          eligibleV.find((v) => /avc1/i.test(v.type + v.encoding)) ||
+          eligibleV[0] ||
+          vTracks[0] ||
+          null;
+      }
+    }
+
     const aPicked =
       (opts.aItag ? aTracks.find((a) => a.itag === opts.aItag) : null) ||
       aTracks[0] ||
@@ -3221,8 +4283,17 @@ async function startServer(): Promise<void> {
     if (vPicked?.url && aPicked?.url && FFMPEG_AVAILABLE) {
       const vUrl = vPicked.url;
       const aUrl = aPicked.url;
+      const vIsVp9OrAv1 = /vp0?9|av01/i.test(vPicked.type + vPicked.encoding);
+      const outputWebm = wantWebm && vIsVp9OrAv1;
       const isAudioAac = /mp4a/i.test(aPicked.type + aPicked.encoding) || aPicked.itag === '140';
-      const ffArgs: string[] = ['-loglevel', 'error'];
+      const isAudioOpus = /opus/i.test(aPicked.type + aPicked.encoding) || aPicked.itag === '251';
+
+      const ffArgs: string[] = [
+        '-loglevel', 'error',
+        '-fflags', '+genpts+discardcorrupt',
+        '-probesize', '1000000',
+        '-analyzeduration', '1500000',
+      ];
       if (streamConfig.outboundProxyUrl && /^https?:\/\//i.test(streamConfig.outboundProxyUrl)) {
         ffArgs.push('-http_proxy', streamConfig.outboundProxyUrl);
       }
@@ -3235,10 +4306,16 @@ async function startServer(): Promise<void> {
         '-reconnect', '1', '-reconnect_streamed', '1', '-reconnect_delay_max', '3', '-i', aUrl,
         '-map', '0:v:0',
         '-map', '1:a:0',
+        '-avoid_negative_ts', 'make_zero',
+        '-max_muxing_queue_size', '2048',
         '-c:v', 'copy',
-        ...(isAudioAac ? ['-c:a', 'copy'] : ['-c:a', 'aac', '-b:a', '192k']),
-        '-movflags', 'frag_keyframe+empty_moov+default_base_moof',
-        '-f', 'mp4',
+        ...(outputWebm
+          ? [...(isAudioOpus ? ['-c:a', 'copy'] : ['-c:a', 'libopus', '-b:a', '160k']), '-f', 'webm']
+          : [
+              ...(isAudioAac ? ['-c:a', 'copy'] : ['-c:a', 'aac', '-b:a', '192k']),
+              '-movflags', 'frag_keyframe+empty_moov+default_base_moof',
+              '-f', 'mp4',
+            ]),
         'pipe:1',
       );
 
@@ -3264,10 +4341,11 @@ async function startServer(): Promise<void> {
             clearTimeout(startTimeout);
             if (!res.headersSent) {
               res.status(200);
-              res.setHeader('Content-Type', 'video/mp4');
+              res.setHeader('Content-Type', outputWebm ? 'video/webm' : 'video/mp4');
               res.setHeader('Cache-Control', 'no-store');
-              res.setHeader('X-Stream-Mode', 'ffmpeg-mux-copy');
+              res.setHeader('X-Stream-Mode', outputWebm ? 'ffmpeg-mux-webm-copy' : 'ffmpeg-mux-copy');
               res.setHeader('X-Stream-Quality', vPicked.qualityLabel || vPicked.itag);
+              res.setHeader('X-Stream-Codec', vPicked.encoding || vPicked.type);
             }
           }
           if (!res.writableEnded) res.write(chunk);
@@ -3323,13 +4401,15 @@ async function startServer(): Promise<void> {
     res.end();
   }
 
-  // 12. GET /api/v1/stream/mux (Real-time FFmpeg 4K/1080p video + audio fragmented MP4 remuxer with ?t= seek support)
+  // 12. GET /api/v1/stream/mux (Real-time FFmpeg 4K/1440p/1080p video + audio remuxer with ?t= seek & ?q= support)
   app.get('/api/v1/stream/mux', async (req, res) => {
     const id = String(req.query.id || '').trim();
     const vItag = String(req.query.v || '').trim() || undefined;
     const aItag = String(req.query.a || '').trim() || undefined;
-    const maxHeight = Number(req.query.maxHeight || req.query.q || 2160) || 2160;
+    const maxHeight = parseRequestedHeight(req.query.maxHeight || req.query.q, 2160);
     const seekSec = Math.max(0, Number(req.query.t || 0) || 0);
+    const codecPref = String(req.query.codec || 'auto').trim();
+    const formatPref = String(req.query.format || 'mp4').trim();
 
     if (!/^[a-zA-Z0-9_-]{6,20}$/.test(id)) {
       res.status(400).json({ error: 'Valid video id parameter is required' });
@@ -3343,6 +4423,8 @@ async function startServer(): Promise<void> {
         vItag,
         aItag,
         rangeHeader: req.headers.range,
+        codecPref,
+        formatPref,
       });
     } catch (err) {
       if (!res.headersSent) {
@@ -3426,7 +4508,7 @@ async function startServer(): Promise<void> {
     }
   });
 
-  // 12c. Shared On-demand FFmpeg H.264/AAC HLS .m3u8 packager & handler
+  // 12c. Shared On-demand FFmpeg H.264/AAC HLS .m3u8 packager & handler (supports ?q=1080/1440/2160/720)
   const activeHlsJobs = new Map<string, { dir: string; startedAt: number }>();
 
   async function serveHlsFile(
@@ -3434,19 +4516,21 @@ async function startServer(): Promise<void> {
     file: string,
     segmentPrefix: string,
     res: express.Response,
+    maxHeight = 1080,
   ): Promise<void> {
     if (!id || !/^(index\.m3u8|seg_\d{4}\.ts)$/.test(file)) {
       res.status(400).json({ error: 'Invalid HLS request' });
       return;
     }
 
-    const hlsDir = path.join('/tmp/kurostream-hls', id);
+    const jobKey = `${id}_${maxHeight}`;
+    const hlsDir = path.join('/tmp/kurostream-hls', jobKey);
     const targetFile = path.join(hlsDir, file);
     const playlistFile = path.join(hlsDir, 'index.m3u8');
 
     const needsBuild =
       file === 'index.m3u8' &&
-      !activeHlsJobs.has(id) &&
+      !activeHlsJobs.has(jobKey) &&
       (!fs.existsSync(playlistFile) || !fs.readFileSync(playlistFile, 'utf8').includes('.ts'));
 
     if (needsBuild) {
@@ -3458,7 +4542,14 @@ async function startServer(): Promise<void> {
 
       const vTracks = (video?.adaptiveFormats || [])
         .filter((f) => f.type.startsWith('video/') && f.url)
-        .sort((a, b) => (parseInt(b.qualityLabel || '0', 10) || 0) - (parseInt(a.qualityLabel || '0', 10) || 0));
+        .filter((f) => (parseInt(f.qualityLabel || '0', 10) || 0) <= maxHeight)
+        .sort((a, b) => {
+          const hDiff = (parseInt(b.qualityLabel || '0', 10) || 0) - (parseInt(a.qualityLabel || '0', 10) || 0);
+          if (hDiff !== 0) return hDiff;
+          const aH264 = /avc1/i.test(a.type + a.encoding) ? 1 : 0;
+          const bH264 = /avc1/i.test(b.type + b.encoding) ? 1 : 0;
+          return bH264 - aH264;
+        });
       const h264Adaptive = vTracks.find(
         (f) => f.encoding.toLowerCase().includes('avc1') || f.type.toLowerCase().includes('avc1'),
       );
@@ -3472,9 +4563,9 @@ async function startServer(): Promise<void> {
         });
       const prog = video?.formatStreams?.find((f) => f.container === 'mp4' && f.url) || video?.formatStreams?.[0];
 
-      const pickedVideo = h264Adaptive || prog || vTracks[0];
+      const pickedVideo = maxHeight >= 1440 ? (vTracks[0] || h264Adaptive || prog) : (h264Adaptive || vTracks[0] || prog);
       const vUrl = pickedVideo?.url || companionStreamUrl(id, '18');
-      const needsTranscode = Boolean(pickedVideo && !h264Adaptive && pickedVideo !== prog);
+      const needsTranscode = Boolean(pickedVideo && !/avc1/i.test((pickedVideo.type || '') + (pickedVideo.encoding || '')) && pickedVideo !== prog);
       const aPicked = pickedVideo !== prog && aTracks[0] ? aTracks[0] : null;
       const aUrl = aPicked?.url || null;
       const isAudioAac = Boolean(aPicked && (/mp4a/i.test(aPicked.type + aPicked.encoding) || aPicked.itag === '140'));
@@ -3489,7 +4580,12 @@ async function startServer(): Promise<void> {
         fs.rmSync(path.join(hlsDir, old), { force: true });
       }
 
-      const ffArgs: string[] = ['-loglevel', 'error'];
+      const ffArgs: string[] = [
+        '-loglevel', 'error',
+        '-fflags', '+genpts+discardcorrupt',
+        '-probesize', '1000000',
+        '-analyzeduration', '1500000',
+      ];
       if (streamConfig.outboundProxyUrl && /^https?:\/\//i.test(streamConfig.outboundProxyUrl)) {
         ffArgs.push('-http_proxy', streamConfig.outboundProxyUrl);
       }
@@ -3510,10 +4606,12 @@ async function startServer(): Promise<void> {
         );
       }
       ffArgs.push(
+        '-avoid_negative_ts', 'make_zero',
+        '-max_muxing_queue_size', '2048',
         '-c:v', needsTranscode ? 'libx264' : 'copy',
-        ...(needsTranscode ? ['-preset', 'veryfast', '-crf', '22'] : []),
+        ...(needsTranscode ? ['-preset', 'ultrafast', '-tune', 'zerolatency', '-pix_fmt', 'yuv420p', '-g', '48', '-sc_threshold', '0', '-crf', '22'] : []),
         ...(aUrl && isAudioAac ? ['-c:a', 'copy'] : !aUrl && pickedVideo === prog ? ['-c:a', 'copy'] : ['-c:a', 'aac', '-b:a', '192k']),
-        '-hls_time', '3',
+        '-hls_time', '2',
         '-hls_list_size', '0',
         '-hls_playlist_type', 'event',
         '-hls_flags', 'temp_file',
@@ -3521,14 +4619,14 @@ async function startServer(): Promise<void> {
         playlistFile,
       );
 
-      activeHlsJobs.set(id, { dir: hlsDir, startedAt: Date.now() });
+      activeHlsJobs.set(jobKey, { dir: hlsDir, startedAt: Date.now() });
       const ff = spawn(FFMPEG_BIN, ffArgs);
       ff.on('exit', () => {
         setTimeout(() => {
-          activeHlsJobs.delete(id);
+          activeHlsJobs.delete(jobKey);
         }, 600_000);
       });
-      ff.on('error', () => activeHlsJobs.delete(id));
+      ff.on('error', () => activeHlsJobs.delete(jobKey));
     }
 
     if (file === 'index.m3u8') {
@@ -3537,19 +4635,21 @@ async function startServer(): Promise<void> {
         if (fs.existsSync(targetFile) && fs.readFileSync(targetFile, 'utf8').includes('.ts')) {
           break;
         }
-        await new Promise((r) => setTimeout(r, 150));
+        await new Promise((r) => setTimeout(r, 120));
       }
       if (!fs.existsSync(targetFile)) {
         res.status(504).json({ error: 'HLS manifest preparation timeout' });
         return;
       }
+      const qSuffix = maxHeight !== 1080 ? `?q=${maxHeight}` : '';
       const rawPlaylist = fs.readFileSync(targetFile, 'utf8');
       const rewritten = rawPlaylist
         .split('\n')
-        .map((line) => (line.trim().endsWith('.ts') ? `${segmentPrefix}/${line.trim()}` : line))
+        .map((line) => (line.trim().endsWith('.ts') ? `${segmentPrefix}/${line.trim()}${qSuffix}` : line))
         .join('\n');
       res.setHeader('Content-Type', 'application/vnd.apple.mpegurl');
       res.setHeader('Cache-Control', 'no-store');
+      res.setHeader('X-Stream-Quality', `${maxHeight}p-hls`);
       res.send(rewritten);
       return;
     }
@@ -3565,7 +4665,8 @@ async function startServer(): Promise<void> {
   app.get('/api/v1/stream/hls-gen/:id/:file', async (req, res) => {
     const id = String(req.params.id || '').replace(/[^a-zA-Z0-9_-]/g, '');
     const file = String(req.params.file || '');
-    await serveHlsFile(id, file, `/api/v1/stream/hls-gen/${encodeURIComponent(id)}`, res);
+    const maxH = parseRequestedHeight(req.query.maxHeight || req.query.q, 1080);
+    await serveHlsFile(id, file, `/api/v1/stream/hls-gen/${encodeURIComponent(id)}`, res, maxH);
   });
 
   // 12d. GET /api/v1/download/:id (Video & Audio File Download: MP4 Mux / Progressive MP4 / Audio)
@@ -3825,7 +4926,20 @@ async function startServer(): Promise<void> {
     };
 
     try {
-      let picked = await resolveTargetUrl(false);
+      const fastItag = requestedItag || (profile === 'stable' ? '18' : '18');
+      let targetUrl = rawSrc;
+      let targetItag = fastItag;
+
+      if (profile === 'fast' && req.query.inspect !== 'true') {
+        const directCached = cacheGet<{ url: string }>(`stream:${id}:${fastItag}`);
+        targetUrl = directCached.data?.url || targetUrl || companionStreamUrl(id, fastItag);
+        if (!directCached.hit) ensureVideoCached(id, false).catch(() => {});
+        res.setHeader('X-Googlevideo-Relay', 'ip-masked');
+        await streamFastServer1Response(id, targetItag, targetUrl, req, res);
+        return;
+      }
+
+      const picked = await resolveTargetUrl(false);
       if (req.query.inspect === 'true') {
         res.setHeader('X-Cache', 'DYNAMIC');
         res.setHeader('X-Upstream-Node', 'kuro-googlevideo-relay');
@@ -3844,41 +4958,10 @@ async function startServer(): Promise<void> {
         return;
       }
 
-      if (!picked?.url) {
-        res.status(404).json({ error: 'Googlevideo MP4 ストリームが未解決です。自動フォールバックまたは Edu再生をお試しください。' });
-        return;
-      }
-
-      const targetUrl = picked?.url || companionStreamUrl(id, picked?.itag || requestedItag || '18');
-      const targetItag = picked?.itag || requestedItag || '18';
-      const upstream = await fetchUpstreamMediaWithFailover(id, targetItag, targetUrl, req.headers.range);
-
-      res.status(upstream.status);
-      const ct = upstream.headers.get('content-type') || 'video/mp4';
-      const cl = upstream.headers.get('content-length');
-      const cr = upstream.headers.get('content-range');
-      const ar = upstream.headers.get('accept-ranges') || 'bytes';
-      res.setHeader('Content-Type', ct);
-      res.setHeader('Accept-Ranges', ar);
+      targetUrl = picked?.url || companionStreamUrl(id, picked?.itag || requestedItag || '18');
+      targetItag = picked?.itag || requestedItag || '18';
       res.setHeader('X-Googlevideo-Relay', 'ip-masked');
-      res.setHeader('X-Googlevideo-Itag', targetItag);
-      if (cl) res.setHeader('Content-Length', cl);
-      if (cr) res.setHeader('Content-Range', cr);
-
-      if (!upstream.body) {
-        res.end();
-        return;
-      }
-      const reader = upstream.body.getReader();
-      res.on('close', () => {
-        if (!res.writableEnded) reader.cancel().catch(() => {});
-      });
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        if (!res.writableEnded) res.write(Buffer.from(value));
-      }
-      res.end();
+      await streamFastServer1Response(id, targetItag, targetUrl, req, res);
     } catch (err) {
       if (!res.headersSent) {
         res.status(502).json({ error: err instanceof Error ? err.message : 'Googlevideo 中継エラー' });
@@ -3925,6 +5008,7 @@ async function startServer(): Promise<void> {
             (m) => !excludeSet.has(m.videoId),
           );
         }
+        await hydrateBase64Thumbnails(items, 'mqdefault');
         const payload: PersonalizedFeedResponse = {
           items,
           basisTopics: ['急上昇', '4K HDR'],
@@ -4068,6 +5152,7 @@ async function startServer(): Promise<void> {
         ranked.push(picked.item);
       }
 
+      await hydrateBase64Thumbnails(ranked, 'mqdefault');
       const payload: PersonalizedFeedResponse = {
         items: ranked,
         basisTopics: sortedTopics.slice(0, 3),
@@ -4268,6 +5353,7 @@ async function startServer(): Promise<void> {
       const recommendedEngine: Kuro4kStreamResponse['recommendedEngine'] =
         bestV && bestA ? 'sync' : bestProg ? 'progressive' : 'none';
 
+      const thumb4k = await fetchThumbnailBase64(videoId, 'maxresdefault').catch(() => null);
       const payload: Kuro4kStreamResponse = {
         videoId: video.videoId,
         title: video.title,
@@ -4303,7 +5389,8 @@ async function startServer(): Promise<void> {
         progressiveUrl: bestProg
           ? `/latest_version?id=${encodeURIComponent(videoId)}&itag=${encodeURIComponent(bestProg.itag)}`
           : null,
-        thumbnailMaxres: `/api/v1/thumbnail/${videoId}/maxresdefault`,
+        thumbnailMaxres: thumb4k?.dataUri || `/api/v1/thumbnail/${videoId}/maxresdefault`,
+        thumbnailBase64: thumb4k?.dataUri,
         directStreamAvailable: Boolean(video.directStreamAvailable),
         streamErrorReason: video.streamErrorReason,
       };
@@ -4336,6 +5423,7 @@ async function startServer(): Promise<void> {
         if (cached.hit && !cached.stale && cached.data) {
           metrics.hits += 1;
           const d = cached.data;
+          const thumbUri = d.thumbnailBase64 || (await fetchThumbnailBase64(id, 'mqdefault').catch(() => null))?.dataUri;
           return {
             videoId: id,
             ok: true,
@@ -4345,13 +5433,18 @@ async function startServer(): Promise<void> {
             lengthSeconds: d.lengthSeconds,
             viewCountText: d.viewCountText,
             maxResolution: d.maxResolution,
-            thumbnailUrl: `/api/v1/thumbnail/${id}/maxresdefault`,
+            thumbnailUrl: thumbUri || `/api/v1/thumbnail/${id}/maxresdefault`,
+            thumbnailBase64: thumbUri,
           };
         }
         metrics.misses += 1;
         try {
-          const d = await fetchVideoFull(id);
+          const [d, thumb] = await Promise.all([
+            fetchVideoFull(id),
+            fetchThumbnailBase64(id, 'mqdefault').catch(() => null),
+          ]);
           cacheSet(`video:${id}`, d, 300_000, d.upstreamSource || 'innertube-edge');
+          const thumbUri = d.thumbnailBase64 || thumb?.dataUri;
           return {
             videoId: id,
             ok: true,
@@ -4361,7 +5454,8 @@ async function startServer(): Promise<void> {
             lengthSeconds: d.lengthSeconds,
             viewCountText: d.viewCountText,
             maxResolution: d.maxResolution,
-            thumbnailUrl: `/api/v1/thumbnail/${id}/maxresdefault`,
+            thumbnailUrl: thumbUri || `/api/v1/thumbnail/${id}/maxresdefault`,
+            thumbnailBase64: thumbUri,
           };
         } catch (err) {
           return {
@@ -4551,8 +5645,46 @@ async function startServer(): Promise<void> {
       capabilities: inst.capabilities,
       infoEndpoint: `/api/server/${num}/info/:id`,
       streamEndpoint: `/api/server/${num}/stream/:id`,
+      channelEndpoint: `/api/server/${num}/channel/:id`,
       handledRequests: instanceRequestCounts.get(inst.port) || 0,
     });
+  });
+
+  app.get('/api/server/:serverNum/channel/:id', async (req, res) => {
+    const num = Number(req.params.serverNum);
+    const inst = ORIGIN_INSTANCES.find((s) => s.serverNumber === num);
+    if (!inst) {
+      res.status(404).json({ error: 'Server number must be 1 to 5' });
+      return;
+    }
+    const channelId = decodeURIComponent(String(req.params.id || '')).trim();
+    if (!channelId) {
+      res.status(400).json({ error: 'Channel ID or @handle required' });
+      return;
+    }
+    try {
+      const cacheKey = `channel:${channelId}`;
+      if (req.query.refresh !== 'true') {
+        const cached = cacheGet<ChannelResponse>(cacheKey);
+        if (cached.hit && !cached.stale && cached.data) {
+          res.setHeader('X-Cache', 'HIT');
+          res.setHeader('X-Upstream-Node', inst.id);
+          res.json({ serverNumber: inst.serverNumber, serverId: inst.id, ...cached.data });
+          return;
+        }
+      }
+      const result = await fetchChannelFull(channelId);
+      if (!result) {
+        res.status(404).json({ error: 'チャンネルが見つかりません' });
+        return;
+      }
+      cacheSet(cacheKey, result.data, 300_000, result.source);
+      res.setHeader('X-Cache', 'MISS');
+      res.setHeader('X-Upstream-Node', inst.id);
+      res.json({ serverNumber: inst.serverNumber, serverId: inst.id, ...result.data });
+    } catch (err) {
+      res.status(502).json({ error: err instanceof Error ? err.message : 'チャンネル取得エラー' });
+    }
   });
 
   app.get('/api/server/:serverNum/info/:id', async (req, res) => {
@@ -4579,6 +5711,9 @@ async function startServer(): Promise<void> {
       const bestA = aTracks[0] || null;
       const bestProg = video.formatStreams[0] || null;
 
+      // Speculative chunk-0 RAM warm for ultra-fast Server 1 start
+      prefetchChunksAhead(videoId, bestProg?.itag || '18', 0, 2, bestProg?.url || companionStreamUrl(videoId, '18'));
+
       res.setHeader('X-Cache', 'DYNAMIC');
       res.setHeader('X-Upstream-Node', inst.id);
       res.json({
@@ -4591,8 +5726,12 @@ async function startServer(): Promise<void> {
         videoId,
         title: video.title,
         author: video.author,
+        authorId: video.authorId,
         lengthSeconds: video.lengthSeconds,
         maxResolution: bestV?.qualityLabel || bestProg?.qualityLabel || video.maxResolution,
+        thumbnailBase64: video.thumbnailBase64,
+        videoThumbnails: video.videoThumbnails,
+        recommendedVideos: video.recommendedVideos,
         playableStreamUrl: `/api/server/${num}/stream/${encodeURIComponent(videoId)}`,
         mp4Url: `/api/v1/stream/googlevideo/${encodeURIComponent(videoId)}?itag=${encodeURIComponent(bestProg?.itag || '18')}`,
         muxUrl:
@@ -4623,38 +5762,60 @@ async function startServer(): Promise<void> {
       return;
     }
 
+    res.socket?.setNoDelay?.(true);
     res.setHeader('X-Kuro-Server-Id', inst.id);
     res.setHeader('X-Kuro-Server-Port', String(inst.port));
 
     try {
-      const video = await ensureVideoCached(videoId, req.query.refresh === 'true');
       const requestedItag = String(req.query.itag || '').trim();
 
+      // Server 1: Zero-Wait Ultra-Fast RAM-Chunk Edge Range MP4 (does NOT block on fetchVideoFull)
+      if (num === 1) {
+        const defaultItag = String(req.query.q || '').trim() === '720' ? '22' : '18';
+        const pickedItag = requestedItag || defaultItag;
+        const cachedStream = cacheGet<{ url: string }>(`stream:${videoId}:${pickedItag}`);
+        const cachedVideo = cacheGet<VideoResponse>(`video:${videoId}`).data;
+        const fromVid = cachedVideo
+          ? [...cachedVideo.formatStreams, ...cachedVideo.adaptiveFormats].find((f) => f.itag === pickedItag)?.url
+          : undefined;
+        const targetUrl = cachedStream.data?.url || fromVid || companionStreamUrl(videoId, pickedItag);
+        if (!cachedVideo) ensureVideoCached(videoId, false).catch(() => {});
+        await streamFastServer1Response(videoId, pickedItag, targetUrl, req, res);
+        return;
+      }
+
       if (num === 3) {
-        // Server 3: Adaptive HLS (.m3u8) streaming
+        // Server 3: Adaptive HLS (.m3u8) streaming (supports ?q=1080/1440/2160/720)
+        const maxH = parseRequestedHeight(req.query.maxHeight || req.query.q, 1080);
         await serveHlsFile(
           videoId,
           'index.m3u8',
           `/api/server/3/hls/${encodeURIComponent(videoId)}`,
           res,
+          maxH,
         );
         return;
       }
 
       if (num === 2 || num === 5) {
-        // Server 2 (High Quality 4K/1080p Mux MP4) & Server 5 (Auto Failover Mux -> Progressive MP4)
-        const maxH = Number(req.query.maxHeight || req.query.q || (num === 2 ? 2160 : 1080)) || 2160;
+        // Server 2 (High Quality 4K/1440p/1080p Mux) & Server 5 (Auto Failover Mux -> Progressive MP4)
+        const maxH = parseRequestedHeight(req.query.maxHeight || req.query.q, num === 2 ? 2160 : 1080);
         const seekSec = Math.max(0, Number(req.query.t || 0) || 0);
+        const codecPref = String(req.query.codec || 'auto').trim();
+        const formatPref = String(req.query.format || 'mp4').trim();
         await streamMuxedMp4Response(videoId, res, {
           maxHeight: maxH,
           seekSec,
           vItag: requestedItag || undefined,
           rangeHeader: req.headers.range,
+          codecPref,
+          formatPref,
         });
         return;
       }
 
-      // Server 1 (Ultra-Fast Range MP4) & Server 4 (Ultra-Stable Universal H.264/AAC MP4)
+      // Server 4: Ultra-Stable Universal H.264/AAC MP4
+      const video = await ensureVideoCached(videoId, req.query.refresh === 'true');
       const progFmt =
         (requestedItag
           ? [...video.formatStreams, ...video.adaptiveFormats].find((f) => f.itag === requestedItag)
@@ -4669,7 +5830,7 @@ async function startServer(): Promise<void> {
       res.status(upstream.status);
       res.setHeader('Content-Type', upstream.headers.get('content-type') || 'video/mp4');
       res.setHeader('Accept-Ranges', upstream.headers.get('accept-ranges') || 'bytes');
-      res.setHeader('X-Stream-Mode', num === 1 ? 'ultra-fast-range-mp4' : 'ultra-stable-h264-mp4');
+      res.setHeader('X-Stream-Mode', 'ultra-stable-h264-mp4');
       res.setHeader('X-Googlevideo-Itag', pickedItag);
       const cl = upstream.headers.get('content-length');
       const cr = upstream.headers.get('content-range');
@@ -4700,7 +5861,8 @@ async function startServer(): Promise<void> {
     const id = String(req.params.id || '').replace(/[^a-zA-Z0-9_-]/g, '');
     const file = String(req.params.file || '');
     const num = Number(req.params.serverNum) || 3;
-    await serveHlsFile(id, file, `/api/server/${num}/hls/${encodeURIComponent(id)}`, res);
+    const maxH = parseRequestedHeight(req.query.maxHeight || req.query.q, 1080);
+    await serveHlsFile(id, file, `/api/server/${num}/hls/${encodeURIComponent(id)}`, res, maxH);
   });
 
   // 独自 API 6: GET /api/kuro/stable-stream/:id (安定型: 学校端末対応 H.264 MP4 + Server 4 直結)
@@ -4939,11 +6101,11 @@ async function startServer(): Promise<void> {
   async function probeHttpLiveness(
     url: string,
     headers: Record<string, string> = {},
-    timeoutMs = 2400,
+    timeoutMs = 1500,
   ): Promise<{ ok: boolean; statusCode: number | null; latencyMs: number | null; version?: string }> {
     const t0 = performance.now();
     try {
-      const r = await proxiedFetch(url, {
+      const r = await probeFetch(url, {
         headers: { 'User-Agent': PRIVACY_USER_AGENTS[0], ...headers },
         signal: AbortSignal.timeout(timeoutMs),
       });
@@ -4984,9 +6146,9 @@ async function startServer(): Promise<void> {
     const testVid = 'aqz-KE-bpKQ';
     try {
       if (kind === 'invidious') {
-        const r = await proxiedFetch(`${clean}/api/v1/videos/${testVid}`, {
+        const r = await probeFetch(`${clean}/api/v1/videos/${testVid}`, {
           headers: { 'User-Agent': PRIVACY_USER_AGENTS[0] },
-          signal: AbortSignal.timeout(2400),
+          signal: AbortSignal.timeout(1700),
         });
         if (!r.ok) {
           cacheSet(cacheKey, false, 120_000, 'stage2');
@@ -5000,14 +6162,14 @@ async function startServer(): Promise<void> {
       }
 
       // Piped or Zernio
-      let r = await proxiedFetch(`${clean}/streams/${testVid}`, {
+      let r = await probeFetch(`${clean}/streams/${testVid}`, {
         headers: { 'User-Agent': PRIVACY_USER_AGENTS[0] },
-        signal: AbortSignal.timeout(2400),
+        signal: AbortSignal.timeout(1700),
       });
       if (!r.ok && kind === 'zernio') {
-        r = await proxiedFetch(`${clean}/api/v1/videos/${testVid}`, {
+        r = await probeFetch(`${clean}/api/v1/videos/${testVid}`, {
           headers: { 'User-Agent': PRIVACY_USER_AGENTS[0] },
-          signal: AbortSignal.timeout(2400),
+          signal: AbortSignal.timeout(1700),
         });
       }
       if (!r.ok) {
@@ -5036,59 +6198,67 @@ async function startServer(): Promise<void> {
     customInvidiousUrl?: string,
     customZernioUrl?: string,
   ): Promise<LiveServersResponse> {
+    const t0 = performance.now();
     const checkedAt = new Date().toISOString();
     const pools = await discoverDynamicExternalPools(customInvidiousUrl, customZernioUrl);
 
-    const [clusterProbes, invProbes, zernioProbes, pipedProbes] = await Promise.all([
-      // Probe all 10 live isolated origin HTTP instances (127.0.0.1:3001 - 3010)
-      Promise.all(
-        ORIGIN_INSTANCES.map(async (inst): Promise<LiveServerCheckItem> => {
-          const probe = await probeHttpLiveness(
-            `http://${ORIGIN_HOST}:${inst.port}/health`,
-            { 'x-kuro-origin-token': ORIGIN_AUTH_TOKEN },
-            1800,
-          );
-          const alive: LiveServerCheckItem['alive'] =
-            probe.statusCode === null
-              ? 'dead'
-              : probe.ok
-                ? (probe.latencyMs ?? 0) < 1200
-                  ? 'alive'
-                  : 'degraded'
-                : 'degraded';
-          return {
-            id: inst.id,
-            name: inst.name,
-            category: 'self-cluster',
-            categoryLabel: `5ストリームサーバー (${inst.tierLabel})`,
-            url: `${inst.endpoint} (:${inst.port})`,
-            region: 'JP-Edge',
-            statusCode: probe.statusCode,
-            alive,
-            latencyMs: probe.latencyMs,
-            cors: true,
-            supportsStreams: true,
-            streamVerified: alive !== 'dead',
-            reliabilityScore: alive === 'alive' ? 100 : alive === 'degraded' ? 75 : 0,
-            checkedAt,
-            note: `${inst.capabilities.join(' · ')} · 処理 ${instanceRequestCounts.get(inst.port) || 0}件`,
-          };
-        }),
-      ),
+    const invCandidates = pools.invidious.slice(0, 60);
+    const zernioCandidates = pools.zernio;
+    const pipedCandidates = pools.piped.slice(0, 40);
+    const otherCandidates = pools.other.slice(0, 140);
+    const candidatePoolSize =
+      ORIGIN_INSTANCES.length +
+      invCandidates.length +
+      zernioCandidates.length +
+      pipedCandidates.length +
+      otherCandidates.length;
 
-      // Top 20 Invidious candidates with Stage-2 stream extraction verification
+    // Probe 5 isolated origin servers first so external burst doesn't skew local socket ms
+    const clusterProbes = await Promise.all(
+      ORIGIN_INSTANCES.map(async (inst): Promise<LiveServerCheckItem> => {
+        const probe = await probeHttpLiveness(
+          `http://${ORIGIN_HOST}:${inst.port}/health`,
+          { 'x-kuro-origin-token': ORIGIN_AUTH_TOKEN },
+          1200,
+        );
+        const alive: LiveServerCheckItem['alive'] =
+          probe.statusCode === null
+            ? 'dead'
+            : probe.ok
+              ? (probe.latencyMs ?? 0) < 900
+                ? 'alive'
+                : 'degraded'
+              : 'degraded';
+        return {
+          id: inst.id,
+          name: inst.name,
+          category: 'self-cluster',
+          categoryLabel: `5ストリームサーバー (${inst.tierLabel})`,
+          url: `${inst.endpoint} (:${inst.port})`,
+          region: 'JP-Edge',
+          statusCode: probe.statusCode,
+          alive,
+          latencyMs: probe.latencyMs,
+          cors: true,
+          supportsStreams: true,
+          streamVerified: alive !== 'dead',
+          reliabilityScore: alive === 'alive' ? 100 : alive === 'degraded' ? 75 : 0,
+          checkedAt,
+          note: `${inst.capabilities.join(' · ')} · 処理 ${instanceRequestCounts.get(inst.port) || 0}件`,
+        };
+      }),
+    );
+
+    // Stage 1: Probe 200+ external servers concurrently in ~1.5s
+    const [invProbes, zernioProbes, pipedProbes, otherProbes] = await Promise.all([
       Promise.all(
-        pools.invidious.slice(0, 20).map(async (node, idx): Promise<LiveServerCheckItem> => {
-          const probe = await probeHttpLiveness(`${node.uri}/api/v1/stats`, {}, 2300);
-          let streamVerified = false;
-          if (probe.ok) {
-            streamVerified = await verifyNodeStreamExtraction(node.uri, 'invidious');
-          }
+        invCandidates.map(async (node, idx): Promise<LiveServerCheckItem> => {
+          const probe = await probeHttpLiveness(`${node.uri}/api/v1/stats`, {}, 1500);
           const alive: LiveServerCheckItem['alive'] =
             probe.statusCode === null
               ? 'dead'
               : probe.ok
-                ? (probe.latencyMs ?? 0) < 1500
+                ? (probe.latencyMs ?? 0) < 1100
                   ? 'alive'
                   : 'degraded'
                 : 'dead';
@@ -5096,7 +6266,7 @@ async function startServer(): Promise<void> {
             node.uri,
             'invidious',
             alive !== 'dead',
-            streamVerified,
+            false,
             probe.latencyMs ?? 4000,
             probe.statusCode,
             { region: node.region, version: probe.version, cors: node.cors },
@@ -5115,45 +6285,24 @@ async function startServer(): Promise<void> {
             latencyMs: probe.latencyMs,
             cors: node.cors,
             supportsStreams: alive !== 'dead',
-            streamVerified,
+            streamVerified: Boolean(rec?.streamVerified),
             reliabilityScore: rec?.score ?? (alive === 'alive' ? 70 : 0),
             checkedAt,
-            note: streamVerified
-              ? 'API疎通 + ストリーム実抽出検証OK'
-              : alive === 'alive'
-                ? 'API疎通正常 (軽量検証)'
-                : alive === 'degraded'
-                  ? '高遅延または制限応答'
-                  : '応答なし / 停止中',
+            note: alive === 'alive' ? 'API疎通正常' : alive === 'degraded' ? '高遅延または制限応答' : '応答なし / 停止中',
           };
         }),
       ),
 
-      // Zernio endpoints (multi-path probe)
       Promise.all(
-        pools.zernio.map(async (z): Promise<LiveServerCheckItem> => {
-          const probeTargets = z.id === 'zernio-custom'
-            ? [`${z.url}/v1/health`, `${z.url}/api/v1/stats`, `${z.url}/trending?region=JP`, z.url]
-            : z.id === 'zernio-api'
-              ? [`${z.url}/v1/health`, z.url]
-              : [z.url];
-
-          let bestProbe = await probeHttpLiveness(probeTargets[0], {}, 2300);
-          for (let i = 1; i < probeTargets.length && !bestProbe.ok && bestProbe.statusCode !== 401 && bestProbe.statusCode !== 403; i++) {
-            bestProbe = await probeHttpLiveness(probeTargets[i], {}, 2200);
-          }
-
-          let streamVerified = false;
-          if (z.id === 'zernio-custom' && (bestProbe.ok || bestProbe.statusCode === 401)) {
-            streamVerified = await verifyNodeStreamExtraction(z.url, 'zernio');
-          }
-
+        zernioCandidates.map(async (z): Promise<LiveServerCheckItem> => {
+          const target = z.id === 'zernio-api' ? `${z.url}/v1/health` : z.url;
+          const bestProbe = await probeHttpLiveness(target, {}, 1500);
           const isUp = bestProbe.ok || bestProbe.statusCode === 401 || bestProbe.statusCode === 403;
           const alive: LiveServerCheckItem['alive'] =
             bestProbe.statusCode === null
               ? 'dead'
               : isUp
-                ? (bestProbe.latencyMs ?? 0) < 1500
+                ? (bestProbe.latencyMs ?? 0) < 1200
                   ? 'alive'
                   : 'degraded'
                 : 'dead';
@@ -5162,7 +6311,7 @@ async function startServer(): Promise<void> {
             z.url,
             'zernio',
             isUp,
-            streamVerified,
+            false,
             bestProbe.latencyMs ?? 4000,
             bestProbe.statusCode,
             { region: z.region, cors: true },
@@ -5180,12 +6329,11 @@ async function startServer(): Promise<void> {
             latencyMs: bestProbe.latencyMs,
             cors: true,
             supportsStreams: z.id === 'zernio-custom' && isUp,
-            streamVerified,
+            streamVerified: false,
             reliabilityScore: rec?.score ?? (isUp ? 60 : 0),
             checkedAt,
-            note: streamVerified
-              ? 'Zernio ストリーム抽出検証OK'
-              : bestProbe.statusCode === 401 || bestProbe.statusCode === 403
+            note:
+              bestProbe.statusCode === 401 || bestProbe.statusCode === 403
                 ? 'サーバー生存 (API認証ゲート稼働中)'
                 : alive === 'alive'
                   ? 'オンライン稼働中'
@@ -5194,19 +6342,14 @@ async function startServer(): Promise<void> {
         }),
       ),
 
-      // Top 12 Piped candidates with Stage-2 stream extraction verification
       Promise.all(
-        pools.piped.slice(0, 12).map(async (p, idx): Promise<LiveServerCheckItem> => {
-          const probe = await probeHttpLiveness(`${p.url}/trending?region=JP`, {}, 2300);
-          let streamVerified = false;
-          if (probe.ok) {
-            streamVerified = await verifyNodeStreamExtraction(p.url, 'piped');
-          }
+        pipedCandidates.map(async (p, idx): Promise<LiveServerCheckItem> => {
+          const probe = await probeHttpLiveness(`${p.url}/trending?region=JP`, {}, 1500);
           const alive: LiveServerCheckItem['alive'] =
             probe.statusCode === null
               ? 'dead'
               : probe.ok
-                ? (probe.latencyMs ?? 0) < 1500
+                ? (probe.latencyMs ?? 0) < 1100
                   ? 'alive'
                   : 'degraded'
                 : 'dead';
@@ -5214,7 +6357,7 @@ async function startServer(): Promise<void> {
             p.url,
             'piped',
             alive !== 'dead',
-            streamVerified,
+            false,
             probe.latencyMs ?? 4000,
             probe.statusCode,
             { region: p.region, cors: true },
@@ -5232,20 +6375,77 @@ async function startServer(): Promise<void> {
             latencyMs: probe.latencyMs,
             cors: true,
             supportsStreams: alive !== 'dead',
-            streamVerified,
+            streamVerified: Boolean(rec?.streamVerified),
             reliabilityScore: rec?.score ?? (alive === 'alive' ? 70 : 0),
             checkedAt,
-            note: streamVerified
-              ? 'Piped ストリーム実抽出検証OK'
-              : alive === 'alive'
-                ? 'ストリーム解決可'
-                : '応答エラー / 停止',
+            note: alive === 'alive' ? 'ストリーム解決可' : '応答エラー / 停止',
+          };
+        }),
+      ),
+
+      Promise.all(
+        otherCandidates.map(async (o): Promise<LiveServerCheckItem> => {
+          const probe = await probeHttpLiveness(`${o.url}${o.probePath}`, {}, 1450);
+          const alive: LiveServerCheckItem['alive'] =
+            probe.statusCode === null
+              ? 'dead'
+              : probe.ok || probe.statusCode === 403
+                ? (probe.latencyMs ?? 0) < 1100
+                  ? 'alive'
+                  : 'degraded'
+                : 'dead';
+          recordExternalNodeOutcome(
+            o.url,
+            o.category,
+            alive !== 'dead',
+            false,
+            probe.latencyMs ?? 4000,
+            probe.statusCode,
+            { region: o.region, cors: true },
+          );
+          return {
+            id: o.id,
+            name: o.name,
+            category: o.category,
+            categoryLabel:
+              o.category === 'poketube'
+                ? '外部 PokeTube'
+                : o.category === 'hyperpipe'
+                  ? '外部 Hyperpipe'
+                  : '外部フロントエンド/リレー',
+            url: o.url,
+            region: o.region,
+            statusCode: probe.statusCode,
+            alive,
+            latencyMs: probe.latencyMs,
+            cors: true,
+            supportsStreams: (o.category === 'poketube' || o.category === 'hyperpipe') && alive !== 'dead',
+            streamVerified: false,
+            reliabilityScore: alive === 'alive' ? 75 : alive === 'degraded' ? 45 : 0,
+            checkedAt,
+            note: alive === 'alive' ? '応答正常 (HTTP 200-399)' : alive === 'degraded' ? '低速/保護応答' : '応答なし',
           };
         }),
       ),
     ]);
 
-    // Sort external categories so verified & fastest live nodes appear first
+    // Stage 2: Verify stream extraction ONLY on responsive Invidious/Piped nodes (max 16) in parallel
+    const verifyTargets = [
+      ...invProbes.filter((s) => s.alive !== 'dead').slice(0, 10).map((item) => ({ item, kind: 'invidious' as const })),
+      ...pipedProbes.filter((s) => s.alive !== 'dead').slice(0, 6).map((item) => ({ item, kind: 'piped' as const })),
+    ];
+    await Promise.all(
+      verifyTargets.map(async ({ item, kind }) => {
+        const verified = await verifyNodeStreamExtraction(item.url, kind);
+        item.streamVerified = verified;
+        if (verified) {
+          item.note = 'API疎通 + ストリーム実抽出検証OK';
+          item.reliabilityScore = Math.min(100, (item.reliabilityScore || 70) + 20);
+          recordExternalNodeOutcome(item.url, kind, true, true, item.latencyMs ?? 800, item.statusCode);
+        }
+      }),
+    );
+
     const sortByHealth = (a: LiveServerCheckItem, b: LiveServerCheckItem) => {
       const sa = (a.streamVerified ? 1000 : 0) + (a.alive === 'alive' ? 300 : a.alive === 'degraded' ? 100 : 0) + (a.reliabilityScore ?? 0);
       const sb = (b.streamVerified ? 1000 : 0) + (b.alive === 'alive' ? 300 : b.alive === 'degraded' ? 100 : 0) + (b.reliabilityScore ?? 0);
@@ -5256,10 +6456,13 @@ async function startServer(): Promise<void> {
     invProbes.sort(sortByHealth);
     zernioProbes.sort(sortByHealth);
     pipedProbes.sort(sortByHealth);
+    otherProbes.sort(sortByHealth);
 
-    const servers = [...clusterProbes, ...invProbes, ...zernioProbes, ...pipedProbes];
+    const servers = [...clusterProbes, ...invProbes, ...pipedProbes, ...zernioProbes, ...otherProbes];
     return {
       checkedAt,
+      elapsedMs: Math.round((performance.now() - t0) * 100) / 100,
+      candidatePoolSize,
       summary: {
         total: servers.length,
         alive: servers.filter((s) => s.alive === 'alive').length,
@@ -5269,34 +6472,65 @@ async function startServer(): Promise<void> {
         invidiousAlive: invProbes.filter((s) => s.alive !== 'dead').length,
         zernioAlive: zernioProbes.filter((s) => s.alive !== 'dead').length,
         pipedAlive: pipedProbes.filter((s) => s.alive !== 'dead').length,
+        otherAlive: otherProbes.filter((s) => s.alive !== 'dead').length,
       },
       servers,
     };
   }
 
-  // 独自 API 10: GET /api/kuro/live-servers (全サーバー 生存/遅延/停止 & ストリーム抽出検証)
-  app.get('/api/kuro/live-servers', async (req, res) => {
+  // 独自 API 10: GET /api/kuro/live-servers & /api/kuro/external-search (200+外部サーバー超高速並列探索)
+  const handleLiveServerSearch = async (req: express.Request, res: express.Response) => {
     const refresh = req.query.refresh === 'true';
     const customInv = String(req.query.customInvidious || '').trim();
     const customZernio = String(req.query.customZernio || '').trim();
+    const q = String(req.query.q || '').trim().toLowerCase();
+    const categoryFilter = String(req.query.category || '').trim().toLowerCase();
+    const aliveOnly = req.query.aliveOnly === 'true';
+    const limit = Math.max(1, Math.min(300, Number(req.query.limit || 250) || 250));
     const cacheKey = `kuro:live-servers:${customInv}:${customZernio}`;
 
+    let snapshot: LiveServersResponse | undefined;
+    let cacheState = 'MISS';
     if (!refresh) {
       const cached = cacheGet<LiveServersResponse>(cacheKey);
       if (cached.hit && !cached.stale && cached.data) {
-        res.setHeader('X-Cache', 'HIT');
-        res.setHeader('X-Upstream-Node', 'kuro-liveness-monitor');
-        res.json(cached.data);
-        return;
+        snapshot = cached.data;
+        cacheState = 'HIT';
       }
     }
+    if (!snapshot) {
+      snapshot = await buildLiveServersSnapshot(customInv, customZernio);
+      cacheSet(cacheKey, snapshot, 45_000, 'kuro-liveness-monitor');
+    }
 
-    const snapshot = await buildLiveServersSnapshot(customInv, customZernio);
-    cacheSet(cacheKey, snapshot, 35_000, 'kuro-liveness-monitor');
-    res.setHeader('X-Cache', 'MISS');
+    let filtered = snapshot.servers;
+    if (q) {
+      filtered = filtered.filter(
+        (s) =>
+          s.name.toLowerCase().includes(q) ||
+          s.url.toLowerCase().includes(q) ||
+          s.category.toLowerCase().includes(q) ||
+          s.region.toLowerCase().includes(q),
+      );
+    }
+    if (categoryFilter) {
+      filtered = filtered.filter((s) => s.category.toLowerCase() === categoryFilter);
+    }
+    if (aliveOnly) {
+      filtered = filtered.filter((s) => s.alive !== 'dead');
+    }
+    const sliced = filtered.slice(0, limit);
+
+    res.setHeader('X-Cache', cacheState);
     res.setHeader('X-Upstream-Node', 'kuro-liveness-monitor');
-    res.json(snapshot);
-  });
+    res.json({
+      ...snapshot,
+      filteredCount: filtered.length,
+      servers: sliced,
+    });
+  };
+  app.get('/api/kuro/live-servers', handleLiveServerSearch);
+  app.get('/api/kuro/external-search', handleLiveServerSearch);
 
   // ブラウザ検証成功ノードをサーバー側の生存ランキングへ即時反映
   app.post('/api/kuro/nodes/report-live', (req, res) => {
@@ -5326,39 +6560,33 @@ async function startServer(): Promise<void> {
     res.json({ ok: true, registrySize: externalNodeRegistry.size });
   });
 
-  // 先読みプリフェッチ API: 関連上位動画のメタデータ＋サムネイルをバックグラウンド先読み
+  // 先読みプリフェッチ API: 関連上位動画のメタデータ＋Base64サムネイル＋先頭ストリームチャンクをバックグラウンド先読み
   app.post('/api/kuro/prefetch', async (req, res) => {
     const idsRaw: unknown[] = Array.isArray(req.body?.ids) ? req.body.ids : [];
     const ids = Array.from(
       new Set<string>(idsRaw.map((x) => String(x || '').trim())),
     )
       .filter((id) => /^[a-zA-Z0-9_-]{6,20}$/.test(id))
-      .slice(0, 4);
+      .slice(0, 6);
 
     if (ids.length === 0) {
       res.json({ queued: 0, ids: [] });
       return;
     }
 
-    // Warm video metadata + maxres thumbnail in background without blocking response
+    // Warm video metadata + base64 thumbnail + Server 1 chunk 0 in background without blocking response
     Promise.allSettled(
       ids.map(async (id) => {
-        await ensureVideoCached(id, false).catch(() => null);
-        const thumbKey = `thumb:${id}:maxresdefault`;
-        if (!cacheGet<Buffer>(thumbKey).hit) {
-          const r = await proxiedFetch(`https://i.ytimg.com/vi/${encodeURIComponent(id)}/maxresdefault.jpg`, {
-            signal: AbortSignal.timeout(2500),
-          }).catch(() => null);
-          if (r && r.ok) {
-            const buf = Buffer.from(await r.arrayBuffer());
-            if (buf.length > 500) cacheSet(thumbKey, buf, 1_800_000, 'prefetch-thumb');
-          }
-        }
+        await Promise.all([
+          ensureVideoCached(id, false).catch(() => null),
+          fetchThumbnailBase64(id, 'maxresdefault').catch(() => null),
+          fetchAndCacheChunk(id, '18', 0, companionStreamUrl(id, '18')).catch(() => null),
+        ]);
       }),
     ).catch(() => {});
 
     res.setHeader('X-Cache', 'DYNAMIC');
-    res.setHeader('X-Upstream-Node', 'kuro-inst-05');
+    res.setHeader('X-Upstream-Node', 'kuro-inst-01');
     res.json({ queued: ids.length, ids });
   });
 
@@ -6052,7 +7280,9 @@ async function startServer(): Promise<void> {
         'X-Kuro-Instance-Id',
         'X-Kuro-Server-Id',
         'X-Stream-Mode',
+        'X-Stream-Cache',
         'X-Stream-Quality',
+        'X-Stream-Codec',
         'Content-Range',
         'Accept-Ranges',
       ],
@@ -6317,13 +7547,17 @@ async function startServer(): Promise<void> {
       })),
       endpoints: {
         videoInfo: '/api/v1/videos/:id',
+        relatedVideos: '/api/v1/related/:id',
+        channelInfo: '/api/v1/channels/:id',
+        thumbnailBase64: '/api/v1/thumbnail/:id/maxresdefault?format=base64',
         search: '/api/v1/search?q=...',
         googlevideoRangeMp4: '/api/v1/stream/googlevideo/:id?itag=18',
-        ffmpegMux1080p4kMp4: '/api/v1/stream/mux?id=:id',
+        ffmpegMux1080p4kMp4: '/api/v1/stream/mux?id=:id&q=2160',
         adaptiveHlsM3u8: '/api/v1/stream/hls-gen/:id/index.m3u8',
         autoFallback: '/api/kuro/auto-fallback/:id',
         clusterNodes: '/api/kuro/cluster-nodes',
-        liveServers: '/api/kuro/live-servers',
+        liveServers: '/api/kuro/live-servers?limit=250',
+        externalSearch200: '/api/kuro/external-search',
         edgeShield: '/api/kuro/edge-shield',
         eduEmbed: '/api/kuro/edu-embed/:id',
       },

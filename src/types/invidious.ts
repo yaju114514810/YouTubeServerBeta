@@ -48,6 +48,7 @@ export interface RecommendedVideo {
   lengthSeconds: number;
   viewCountText: string;
   viewCount?: number;
+  thumbnailBase64?: string;
 }
 
 export interface VideoResponse {
@@ -55,6 +56,7 @@ export interface VideoResponse {
   title: string;
   videoId: string;
   videoThumbnails: VideoThumbnail[];
+  thumbnailBase64?: string;
   description: string;
   descriptionHtml: string;
   published: number;
@@ -119,6 +121,7 @@ export interface SearchVideoItem {
   authorUrl: string;
   authorVerified?: boolean;
   videoThumbnails: VideoThumbnail[];
+  thumbnailBase64?: string;
   description: string;
   descriptionHtml: string;
   viewCount: number;
@@ -273,6 +276,7 @@ export interface Kuro4kStreamResponse {
   muxUrl: string | null;
   progressiveUrl: string | null;
   thumbnailMaxres: string;
+  thumbnailBase64?: string;
   directStreamAvailable: boolean;
   streamErrorReason?: string;
 }
@@ -288,6 +292,7 @@ export interface KuroBatchMetaItem {
   viewCountText?: string;
   maxResolution?: string;
   thumbnailUrl?: string;
+  thumbnailBase64?: string;
   error?: string;
 }
 
@@ -392,7 +397,7 @@ export interface AutoFallbackStreamResponse {
   maxQuality: string;
 }
 
-export type LiveServerCategory = 'self-cluster' | 'invidious' | 'zernio' | 'piped';
+export type LiveServerCategory = 'self-cluster' | 'invidious' | 'zernio' | 'piped' | 'poketube' | 'hyperpipe' | 'proxy';
 export type LiveServerStatus = 'alive' | 'degraded' | 'dead';
 
 export interface LiveServerCheckItem {
@@ -416,6 +421,8 @@ export interface LiveServerCheckItem {
 
 export interface LiveServersResponse {
   checkedAt: string;
+  elapsedMs?: number;
+  candidatePoolSize?: number;
   summary: {
     total: number;
     alive: number;
@@ -425,6 +432,7 @@ export interface LiveServersResponse {
     invidiousAlive: number;
     zernioAlive: number;
     pipedAlive: number;
+    otherAlive?: number;
   };
   servers: LiveServerCheckItem[];
 }
