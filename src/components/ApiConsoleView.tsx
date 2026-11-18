@@ -60,7 +60,7 @@ const PRESETS: EndpointPreset[] = [
     label: 'GET /api/kuro/auto-fallback/:id',
     template: '/api/kuro/auto-fallback/aqz-KE-bpKQ?profile=auto&downlink=25',
     description:
-      '追加API 1 (自動フォールバック): 環境に応じて7サーバー(高速→高画質→安定→Edu)を順次に自動検証し最善ストリームを返します。',
+      '追加API 1 (自動フォールバック): 環境に応じて10インスタンス(高速→高画質→安定→Edu)を順次に自動検証し最善ストリームを返します。',
   },
   {
     id: 'kuro-cluster',
@@ -69,7 +69,7 @@ const PRESETS: EndpointPreset[] = [
     label: 'GET /api/kuro/cluster-nodes',
     template: '/api/kuro/cluster-nodes',
     description:
-      '追加API 2 (7サーバー監視): 安定型(3)・高速型(2)・高画質型(2)の全7サーバーの死活・応答速度を取得します。',
+      '追加API 2 (10インスタンス監視): 127.0.0.1:3001-3010 の全10台の実稼働HTTPインスタンスの死活・応答速度を取得します。',
   },
   {
     id: 'kuro-stable',
@@ -123,7 +123,7 @@ const PRESETS: EndpointPreset[] = [
     label: 'GET /api/kuro/live-servers',
     template: '/api/kuro/live-servers',
     description:
-      '追加API 8 (死活監視): 自前7サーバー・外部 Invidious・Zernio・Piped サーバーの生存/遅延/停止状態をリアルタイム判定します。',
+      '追加API 8 (死活監視): 自前10インスタンス・外部 Invidious・Zernio・Piped サーバーの生存と実ストリーム抽出可否をリアルタイム判定します。',
   },
   {
     id: 'kuro-external-recover',
@@ -134,6 +134,16 @@ const PRESETS: EndpointPreset[] = [
     defaultBody: JSON.stringify({ customInvidiousUrl: '', customZernioUrl: '' }, null, 2),
     description:
       '追加API 9 (外部自動復旧): 生存中の外部 Invidious & Zernio/Piped サーバーを探索し、ストリームを自動復旧します。',
+  },
+  {
+    id: 'kuro-prefetch',
+    group: 'custom',
+    method: 'POST',
+    label: 'POST /api/kuro/prefetch',
+    template: '/api/kuro/prefetch',
+    defaultBody: DEFAULT_BATCH_BODY,
+    description:
+      '追加API 10 (先読みキャッシュ): 次動画のメタデータとサムネイルをプロキシクラスタ側へ事前キャッシュします。',
   },
   {
     id: 'kuro-translate',
@@ -150,7 +160,7 @@ const PRESETS: EndpointPreset[] = [
       2,
     ),
     description:
-      '追加API 10 (自動翻訳): 海外動画タイトル・概要欄・コメント・字幕を一括翻訳します。',
+      '追加API 11 (自動翻訳): 海外動画タイトル・概要欄・コメント・字幕を一括翻訳します。',
   },
   {
     id: 'video',
@@ -422,7 +432,7 @@ export function ApiConsoleView({ initialEndpoint }: ApiConsoleViewProps) {
         <div className="flex flex-col gap-1.5">
           <div className="pb-2 border-b border-zinc-100 dark:border-zinc-800">
             <h2 className="text-sm font-semibold text-zinc-900 dark:text-zinc-100">
-              KuroStream 独自拡張・7サーバー API (全13種)
+              KuroStream 独自拡張・10インスタンス API (全14種)
             </h2>
             <p className="mt-0.5 text-xs text-zinc-500 dark:text-zinc-400">
               プロキシ保護と4K高速配信に特化した独自エンドポイントです。

@@ -348,6 +348,7 @@ export interface EduEmbedConfig {
   educationUrl?: string;
   embeddable: boolean;
   providerNote: string;
+  proxyFallbackAvailable?: boolean;
 }
 
 export interface ClusterServerNode {
@@ -361,6 +362,8 @@ export interface ClusterServerNode {
   latencyMs: number | null;
   capabilities: string[];
   priority: number;
+  port?: number;
+  handledRequests?: number;
 }
 
 export interface FallbackAttempt {
@@ -407,6 +410,8 @@ export interface LiveServerCheckItem {
   supportsStreams: boolean;
   checkedAt: string;
   note?: string;
+  streamVerified?: boolean;
+  reliabilityScore?: number;
 }
 
 export interface LiveServersResponse {

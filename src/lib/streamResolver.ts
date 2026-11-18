@@ -14,6 +14,8 @@ const BROWSER_CORS_INVIDIOUS = [
   'https://yewtu.be',
   'https://iv.melmac.space',
   'https://invidious.jing.rocks',
+  'https://invidious.snopyta.org',
+  'https://invidious.tiekoetter.com',
 ];
 
 const BROWSER_CORS_PIPED = [
@@ -23,35 +25,83 @@ const BROWSER_CORS_PIPED = [
   'https://api.piped.private.coffee',
   'https://pipedapi.moomoo.me',
   'https://pipedapi.darkness.services',
+  'https://pipedapi.syncpundit.io',
+  'https://pipedapi-libre.kavin.rocks',
 ];
 
-let cachedLiveInvidious: { hosts: string[]; fetchedAt: number } | null = null;
+let cachedDynamicPools: { invidious: string[]; piped: string[]; fetchedAt: number } | null = null;
+const hostScoreMap = new Map<string, number>();
 
-async function fetchDynamicLiveInvidiousHosts(): Promise<string[]> {
-  if (cachedLiveInvidious && Date.now() - cachedLiveInvidious.fetchedAt < 120_000) {
-    return cachedLiveInvidious.hosts;
+function bumpHostScore(url: string, delta: number): void {
+  const clean = url.replace(/\/+$/, '');
+  const cur = hostScoreMap.get(clean) ?? 50;
+  hostScoreMap.set(clean, Math.max(0, Math.min(100, cur + delta)));
+}
+
+function rankHosts(hosts: string[]): string[] {
+  return [...new Set(hosts.map((h) => h.replace(/\/+$/, '')))].sort(
+    (a, b) => (hostScoreMap.get(b) ?? 50) - (hostScoreMap.get(a) ?? 50),
+  );
+}
+
+function reportLiveNodeToServer(
+  url: string,
+  category: 'invidious' | 'zernio' | 'piped',
+  ok: boolean,
+  streamVerified: boolean,
+  latencyMs: number,
+): void {
+  fetch('/api/kuro/nodes/report-live', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ url, category, ok, streamVerified, latencyMs }),
+  }).catch(() => {});
+}
+
+async function fetchDynamicLivePools(): Promise<{ invidious: string[]; piped: string[] }> {
+  if (cachedDynamicPools && Date.now() - cachedDynamicPools.fetchedAt < 120_000) {
+    return {
+      invidious: rankHosts(cachedDynamicPools.invidious),
+      piped: rankHosts(cachedDynamicPools.piped),
+    };
   }
-  const merged = new Set<string>(BROWSER_CORS_INVIDIOUS);
-  try {
-    const res = await fetch('https://api.invidious.io/instances.json?sort_by=health', {
+  const mergedInv = new Set<string>(BROWSER_CORS_INVIDIOUS);
+  const mergedPiped = new Set<string>(BROWSER_CORS_PIPED);
+
+  await Promise.allSettled([
+    fetch('https://api.invidious.io/instances.json?sort_by=health', {
       signal: AbortSignal.timeout(3000),
-    });
-    if (res.ok) {
+    }).then(async (res) => {
+      if (!res.ok) return;
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       const list = (await res.json()) as [string, any][];
       for (const [, meta] of list) {
         if (meta?.type === 'https' && meta?.api && typeof meta?.uri === 'string') {
-          merged.add(meta.uri.replace(/\/+$/, ''));
+          mergedInv.add(meta.uri.replace(/\/+$/, ''));
         }
-        if (merged.size >= 16) break;
+        if (mergedInv.size >= 20) break;
       }
-    }
-  } catch {
-    // keep curated defaults
-  }
-  const hosts = [...merged];
-  cachedLiveInvidious = { hosts, fetchedAt: Date.now() };
-  return hosts;
+    }),
+    fetch('https://piped-instances.kavin.rocks', {
+      signal: AbortSignal.timeout(3000),
+    }).then(async (res) => {
+      if (!res.ok) return;
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const list = (await res.json()) as any[];
+      if (!Array.isArray(list)) return;
+      for (const item of list) {
+        if (typeof item?.api_url === 'string' && item.api_url.startsWith('https://')) {
+          mergedPiped.add(item.api_url.replace(/\/+$/, ''));
+        }
+        if (mergedPiped.size >= 14) break;
+      }
+    }),
+  ]);
+
+  const invidious = rankHosts([...mergedInv]);
+  const piped = rankHosts([...mergedPiped]);
+  cachedDynamicPools = { invidious, piped, fetchedAt: Date.now() };
+  return { invidious, piped };
 }
 
 export interface BrowserResolvedStreams {
@@ -224,79 +274,99 @@ export async function resolveStreamsFromBrowserIp(
   customInvidiousUrl?: string,
   customZernioUrl?: string,
 ): Promise<BrowserResolvedStreams | null> {
-  const dynamicHosts = await fetchDynamicLiveInvidiousHosts();
+  const { invidious: dynamicInv, piped: dynamicPiped } = await fetchDynamicLivePools();
   const invHosts = customInvidiousUrl
-    ? [customInvidiousUrl.replace(/\/+$/, ''), ...dynamicHosts]
-    : dynamicHosts;
+    ? [customInvidiousUrl.replace(/\/+$/, ''), ...dynamicInv]
+    : dynamicInv;
 
   const tasks: Promise<BrowserResolvedStreams>[] = [];
 
-  for (const base of [...new Set(invHosts)].slice(0, 12)) {
+  for (const base of [...new Set(invHosts)].slice(0, 14)) {
     tasks.push(
       (async () => {
-        const r = await fetch(`${base}/api/v1/videos/${encodeURIComponent(videoId)}`, {
-          signal: AbortSignal.timeout(4500),
-        });
-        if (!r.ok) throw new Error(`HTTP ${r.status}`);
-        // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        const d = (await r.json()) as any;
-        const adaptiveRaw = Array.isArray(d?.adaptiveFormats) ? d.adaptiveFormats : [];
-        const formatsRaw = Array.isArray(d?.formatStreams) ? d.formatStreams : [];
-        const hlsUrl = typeof d?.hlsUrl === 'string' && d.hlsUrl ? d.hlsUrl : undefined;
-        if (adaptiveRaw.length === 0 && formatsRaw.length === 0 && !hlsUrl) {
-          throw new Error('empty');
+        const t0 = performance.now();
+        try {
+          const r = await fetch(`${base}/api/v1/videos/${encodeURIComponent(videoId)}`, {
+            signal: AbortSignal.timeout(4500),
+          });
+          if (!r.ok) throw new Error(`HTTP ${r.status}`);
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          const d = (await r.json()) as any;
+          const adaptiveRaw = Array.isArray(d?.adaptiveFormats) ? d.adaptiveFormats : [];
+          const formatsRaw = Array.isArray(d?.formatStreams) ? d.formatStreams : [];
+          const hlsUrl = typeof d?.hlsUrl === 'string' && d.hlsUrl ? d.hlsUrl : undefined;
+          if (adaptiveRaw.length === 0 && formatsRaw.length === 0 && !hlsUrl) {
+            throw new Error('empty');
+          }
+          const ms = Math.max(1, Math.round(performance.now() - t0));
+          bumpHostScore(base, 20);
+          reportLiveNodeToServer(base, 'invidious', true, true, ms);
+          return mapInvidiousPayload(
+            d,
+            videoId,
+            `invidious:${base.replace(/^https?:\/\//, '')}`,
+            'invidious',
+          );
+        } catch (err) {
+          bumpHostScore(base, -15);
+          throw err;
         }
-        return mapInvidiousPayload(
-          d,
-          videoId,
-          `invidious:${base.replace(/^https?:\/\//, '')}`,
-          'invidious',
-        );
       })(),
     );
   }
 
   // Zernio custom / Piped external servers
   const zernioAndPiped = customZernioUrl
-    ? [customZernioUrl.replace(/\/+$/, ''), ...BROWSER_CORS_PIPED]
-    : BROWSER_CORS_PIPED;
+    ? [customZernioUrl.replace(/\/+$/, ''), ...dynamicPiped]
+    : dynamicPiped;
 
-  for (const base of [...new Set(zernioAndPiped)]) {
+  for (const base of [...new Set(zernioAndPiped)].slice(0, 12)) {
     const isCustomZernio = Boolean(customZernioUrl && base === customZernioUrl.replace(/\/+$/, ''));
+    const cat: 'zernio' | 'piped' = isCustomZernio || base.includes('zernio') ? 'zernio' : 'piped';
     tasks.push(
       (async () => {
-        // Support both Piped (/streams/:id) and Invidious-style (/api/v1/videos/:id) on custom Zernio URLs
-        const urlToTry = isCustomZernio
-          ? `${base}/streams/${encodeURIComponent(videoId)}`
-          : `${base}/streams/${encodeURIComponent(videoId)}`;
-        let r = await fetch(urlToTry, { signal: AbortSignal.timeout(4500) });
-        if (!r.ok && isCustomZernio) {
-          r = await fetch(`${base}/api/v1/videos/${encodeURIComponent(videoId)}`, {
+        const t0 = performance.now();
+        try {
+          let r = await fetch(`${base}/streams/${encodeURIComponent(videoId)}`, {
             signal: AbortSignal.timeout(4500),
           });
-        }
-        if (!r.ok) throw new Error(`HTTP ${r.status}`);
-        // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        const d = (await r.json()) as any;
-        if (Array.isArray(d?.adaptiveFormats) || Array.isArray(d?.formatStreams)) {
-          if (!d.adaptiveFormats?.length && !d.formatStreams?.length && !d.hlsUrl) throw new Error('empty');
-          return mapInvidiousPayload(
+          if (!r.ok && cat === 'zernio') {
+            r = await fetch(`${base}/api/v1/videos/${encodeURIComponent(videoId)}`, {
+              signal: AbortSignal.timeout(4500),
+            });
+          }
+          if (!r.ok) throw new Error(`HTTP ${r.status}`);
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          const d = (await r.json()) as any;
+          if (Array.isArray(d?.adaptiveFormats) || Array.isArray(d?.formatStreams)) {
+            if (!d.adaptiveFormats?.length && !d.formatStreams?.length && !d.hlsUrl) throw new Error('empty');
+            const ms = Math.max(1, Math.round(performance.now() - t0));
+            bumpHostScore(base, 20);
+            reportLiveNodeToServer(base, cat, true, true, ms);
+            return mapInvidiousPayload(
+              d,
+              videoId,
+              `${cat}:${base.replace(/^https?:\/\//, '')}`,
+              cat,
+            );
+          }
+          const vList = Array.isArray(d?.videoStreams) ? d.videoStreams : [];
+          const aList = Array.isArray(d?.audioStreams) ? d.audioStreams : [];
+          const hlsUrl = typeof d?.hls === 'string' && d.hls ? d.hls : undefined;
+          if (vList.length === 0 && aList.length === 0 && !hlsUrl) throw new Error('empty');
+          const ms = Math.max(1, Math.round(performance.now() - t0));
+          bumpHostScore(base, 20);
+          reportLiveNodeToServer(base, cat, true, true, ms);
+          return mapPipedPayload(
             d,
             videoId,
-            `${isCustomZernio ? 'zernio' : 'piped'}:${base.replace(/^https?:\/\//, '')}`,
-            isCustomZernio ? 'zernio' : 'piped',
+            `${cat}:${base.replace(/^https?:\/\//, '')}`,
+            cat,
           );
+        } catch (err) {
+          bumpHostScore(base, -15);
+          throw err;
         }
-        const vList = Array.isArray(d?.videoStreams) ? d.videoStreams : [];
-        const aList = Array.isArray(d?.audioStreams) ? d.audioStreams : [];
-        const hlsUrl = typeof d?.hls === 'string' && d.hls ? d.hls : undefined;
-        if (vList.length === 0 && aList.length === 0 && !hlsUrl) throw new Error('empty');
-        return mapPipedPayload(
-          d,
-          videoId,
-          `${isCustomZernio ? 'zernio' : 'piped'}:${base.replace(/^https?:\/\//, '')}`,
-          isCustomZernio ? 'zernio' : 'piped',
-        );
       })(),
     );
   }
@@ -328,7 +398,7 @@ export async function recoverPlaybackFromExternalNodes(
         customInvidiousUrl: customInvidiousUrl || '',
         customZernioUrl: customZernioUrl || '',
       }),
-      signal: AbortSignal.timeout(9000),
+      signal: AbortSignal.timeout(9500),
     }).then(async (r) => (r.ok ? ((await r.json()) as ExternalRecoveryResponse) : null)),
   ]);
 
@@ -393,7 +463,9 @@ export async function probeExternalNodeFromBrowser(
     try {
       const r = await fetch(target, { signal: AbortSignal.timeout(3000) });
       if (r.ok) {
-        return { reachable: true, latencyMs: Math.max(1, Math.round(performance.now() - t0)) };
+        const ms = Math.max(1, Math.round(performance.now() - t0));
+        bumpHostScore(clean, 10);
+        return { reachable: true, latencyMs: ms };
       }
     } catch {
       // try next probe path

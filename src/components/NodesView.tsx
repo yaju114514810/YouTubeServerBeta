@@ -260,7 +260,7 @@ export function NodesView() {
 
         <div className="flex flex-col gap-1 rounded-xl border border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 p-4">
           <span className="text-xs font-medium text-zinc-500 dark:text-zinc-400">
-            7サーバー・クラスタ稼働
+            10インスタンス・クラスタ稼働
           </span>
           <span className="font-mono text-2xl font-semibold text-emerald-600 dark:text-emerald-400 tabular-nums">
             {clusterNodes.length > 0
@@ -268,7 +268,7 @@ export function NodesView() {
               : '—'}
           </span>
           <span className="font-mono text-xs text-zinc-500 dark:text-zinc-400 tabular-nums">
-            安定型 3 · 高速型 2 · 高画質型 2
+            安定型 3 · 高速型 3 · 高画質型 3 · 復旧型 1
           </span>
         </div>
 
@@ -285,19 +285,19 @@ export function NodesView() {
         </div>
       </div>
 
-      {/* 全サーバーリアルタイム死活監視 (自前7サーバー / 外部 Invidious / Zernio / Piped) */}
+      {/* 全サーバーリアルタイム死活監視 (自前10インスタンス / 外部 Invidious / Zernio / Piped) */}
       <div className="flex flex-col rounded-xl border border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 overflow-hidden">
         <div className="flex flex-wrap items-center justify-between gap-3 border-b border-zinc-200 dark:border-zinc-800 px-5 py-4">
           <div className="flex flex-col gap-1">
             <div className="flex items-center gap-2">
               <Activity className="h-4 w-4 text-blue-600 dark:text-blue-400 shrink-0" />
               <h2 className="text-sm font-semibold text-zinc-900 dark:text-zinc-100">
-                全サーバー死活監視モニター (生存 / 遅延 / 停止)
+                全サーバー死活監視モニター (生存 / 遅延 / 停止 · ストリーム実抽出検証)
               </h2>
             </div>
             <p className="font-mono text-xs text-zinc-500 dark:text-zinc-400 tabular-nums">
               {liveReport
-                ? `生存 ${liveReport.summary.alive} · 遅延 ${liveReport.summary.degraded} · 停止 ${liveReport.summary.dead} (自前7: ${liveReport.summary.clusterAlive}/7 · Invidious: ${liveReport.summary.invidiousAlive} · Zernio: ${liveReport.summary.zernioAlive} · Piped: ${liveReport.summary.pipedAlive})`
+                ? `生存 ${liveReport.summary.alive} · 遅延 ${liveReport.summary.degraded} · 停止 ${liveReport.summary.dead} (自前10: ${liveReport.summary.clusterAlive}/10 · Invidious: ${liveReport.summary.invidiousAlive} · Zernio: ${liveReport.summary.zernioAlive} · Piped: ${liveReport.summary.pipedAlive})`
                 : '全サーバーの死活状態を確認中...'}
             </p>
           </div>
@@ -307,7 +307,7 @@ export function NodesView() {
               {(
                 [
                   { id: 'all', label: 'すべて' },
-                  { id: 'self-cluster', label: '自前7' },
+                  { id: 'self-cluster', label: '自前10' },
                   { id: 'invidious', label: 'Invidious' },
                   { id: 'zernio', label: 'Zernio' },
                   { id: 'piped', label: 'Piped' },
@@ -437,15 +437,15 @@ export function NodesView() {
         </div>
       </div>
 
-      {/* 7サーバー自動フォールバック・クラスタ (安定型・高速型・高画質型) */}
+      {/* 10インスタンス自動フォールバック・クラスタ (安定型・高速型・高画質型・復旧型) */}
       <div className="flex flex-col rounded-xl border border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 overflow-hidden">
         <div className="flex flex-wrap items-center justify-between gap-3 border-b border-zinc-200 dark:border-zinc-800 px-5 py-4">
           <div>
             <h2 className="text-sm font-semibold text-zinc-900 dark:text-zinc-100">
-              7サーバー自動フォールバック・クラスタ (/api/kuro/cluster-nodes)
+              10インスタンス自動フォールバック・クラスタ (/api/kuro/cluster-nodes)
             </h2>
             <p className="text-xs text-zinc-500 dark:text-zinc-400">
-              安定型（学校端末・Classroom/Kahoot Edu対応）・高速型（Googlevideo IP偽装 Range）・高画質型（4K60 FFmpeg/HLS）の7系統をリアルタイム死活監視し自動フォールバックします。
+              安定型（学校端末・Classroom/Kahoot Edu対応）・高速型（Googlevideo IP偽装 Range）・高画質型（4K60 FFmpeg/HLS）・統合復旧型の10台の実稼働HTTPインスタンスを死活監視します。
             </p>
           </div>
 
@@ -456,7 +456,7 @@ export function NodesView() {
             className="flex items-center gap-1.5 rounded-lg bg-blue-600 px-3.5 py-1.5 text-xs font-semibold text-white hover:bg-blue-700 transition-colors whitespace-nowrap shrink-0"
           >
             <RefreshCw className={`h-3.5 w-3.5 ${loading ? 'animate-spin' : ''}`} />
-            <span>全7サーバー再計測</span>
+            <span>全10インスタンス再計測</span>
           </button>
         </div>
 
@@ -476,7 +476,7 @@ export function NodesView() {
               {clusterNodes.length === 0 ? (
                 <tr className="h-12">
                   <td colSpan={6} className="px-5 text-center text-zinc-500 dark:text-zinc-400">
-                    7サーバーの死活状態を計測中...
+                    10インスタンスの死活状態を計測中...
                   </td>
                 </tr>
               ) : (

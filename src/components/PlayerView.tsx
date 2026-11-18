@@ -160,6 +160,8 @@ export function PlayerView({
 
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const audioRef = useRef<HTMLAudioElement | null>(null);
+  const eduIframeRef = useRef<HTMLIFrameElement | null>(null);
+  const eduCurrentTimeRef = useRef<number>(0);
   const hlsRef = useRef<Hls | null>(null);
   const triedModesRef = useRef<Set<StreamEngineMode>>(new Set());
   const silentRefreshedRef = useRef(false);
@@ -521,10 +523,16 @@ export function PlayerView({
     };
   }, [comments, settings.autoTranslateEnabled, settings.translateComments, settings.targetLang]);
 
-  // Preload top 3 upcoming related videos + thumbnails automatically for zero-wait next playback
+  // Preload top 3 upcoming related videos + warm backend cluster cache
   useEffect(() => {
     if (!loading && rankedRecommendations.length > 0) {
-      preloadNextVideos(rankedRecommendations.slice(0, 3).map((r) => r.videoId));
+      const nextIds = rankedRecommendations.slice(0, 3).map((r) => r.videoId);
+      preloadNextVideos(nextIds);
+      fetch('/api/kuro/prefetch', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ ids: nextIds.slice(0, 2) }),
+      }).catch(() => {});
     }
   }, [loading, rankedRecommendations]);
 
@@ -806,8 +814,28 @@ export function PlayerView({
     );
   };
 
-  // Smooth, stall-free ±10s skip handler across ALL engines (Range, HLS, Sync, Mux)
+  // Smooth, stall-free ±10s skip handler across ALL engines (Range, HLS, Sync, Mux, AND Edu IFrame)
   const performSkip = (deltaSec: number) => {
+    if (engineMode.startsWith('edu-') && eduIframeRef.current?.contentWindow) {
+      const targetSec = Math.max(
+        0,
+        Math.min((video?.lengthSeconds || 3600) - 0.5, eduCurrentTimeRef.current + deltaSec),
+      );
+      eduCurrentTimeRef.current = targetSec;
+      try {
+        eduIframeRef.current.contentWindow.postMessage(
+          JSON.stringify({ event: 'command', func: 'seekTo', args: [targetSec, true] }),
+          '*',
+        );
+      } catch {
+        // ignore cross-origin postMessage edge cases
+      }
+      if (skipBadgeTimerRef.current) window.clearTimeout(skipBadgeTimerRef.current);
+      setSkipFeedback(`${deltaSec > 0 ? `+${deltaSec}` : deltaSec}秒 (${formatDuration(targetSec)})`);
+      skipBadgeTimerRef.current = window.setTimeout(() => setSkipFeedback(null), 1200);
+      return;
+    }
+
     const vEl = videoRef.current;
     if (!vEl) return;
 
@@ -854,7 +882,6 @@ export function PlayerView({
     const onKeyDown = (e: KeyboardEvent) => {
       const tag = (e.target as HTMLElement | null)?.tagName;
       if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return;
-      if (engineMode.startsWith('edu-')) return;
 
       if (e.key === 'ArrowRight' || e.key.toLowerCase() === 'l') {
         e.preventDefault();
@@ -1013,7 +1040,17 @@ export function PlayerView({
   useEffect(() => {
     if (videoRef.current) videoRef.current.playbackRate = playbackRate;
     if (audioRef.current) audioRef.current.playbackRate = playbackRate;
-  }, [playbackRate]);
+    if (engineMode.startsWith('edu-') && eduIframeRef.current?.contentWindow) {
+      try {
+        eduIframeRef.current.contentWindow.postMessage(
+          JSON.stringify({ event: 'command', func: 'setPlaybackRate', args: [playbackRate] }),
+          '*',
+        );
+      } catch {
+        // ignore
+      }
+    }
+  }, [playbackRate, engineMode]);
 
   // Clean up stall watchdog on unmount or video switch
   useEffect(() => {
@@ -1164,6 +1201,11 @@ export function PlayerView({
 
     try {
       const parsed = new URL(rawUrl);
+      parsed.searchParams.set('enablejsapi', '1');
+      if (typeof window !== 'undefined') {
+        parsed.searchParams.set('origin', window.location.origin);
+        parsed.searchParams.set('widget_referrer', window.location.href);
+      }
       parsed.searchParams.set('hl', settings.targetLang);
       if (settings.autoTranslateEnabled && settings.translateCaptions) {
         parsed.searchParams.set('cc_load_policy', '1');
@@ -1179,6 +1221,94 @@ export function PlayerView({
   }, [engineMode, eduConfig, videoId, settings.autoTranslateEnabled, settings.translateCaptions, settings.targetLang]);
 
   const nextQueuedVideo = rankedRecommendations[0] || null;
+
+  // Listen to official YouTube Education IFrame Player API messages (onReady, time sync, auto-next, error failover)
+  useEffect(() => {
+    if (!isEduMode) return;
+    eduCurrentTimeRef.current = 0;
+
+    const sendEduListening = () => {
+      try {
+        eduIframeRef.current?.contentWindow?.postMessage(
+          JSON.stringify({ event: 'listening', id: videoId }),
+          '*',
+        );
+      } catch {
+        // ignore
+      }
+    };
+
+    const handleEduMessage = (event: MessageEvent) => {
+      if (
+        typeof event.origin === 'string' &&
+        !event.origin.includes('youtubeeducation.com') &&
+        !event.origin.includes('youtube-nocookie.com') &&
+        !event.origin.includes('youtube.com')
+      ) {
+        return;
+      }
+      let msg: { event?: string; info?: unknown } | null = null;
+      if (typeof event.data === 'string') {
+        try {
+          msg = JSON.parse(event.data);
+        } catch {
+          return;
+        }
+      } else if (event.data && typeof event.data === 'object') {
+        msg = event.data as { event?: string; info?: unknown };
+      }
+      if (!msg) return;
+
+      if (msg.event === 'onReady') {
+        sendEduListening();
+        if (playbackRate !== 1) {
+          try {
+            eduIframeRef.current?.contentWindow?.postMessage(
+              JSON.stringify({ event: 'command', func: 'setPlaybackRate', args: [playbackRate] }),
+              '*',
+            );
+          } catch {
+            // ignore
+          }
+        }
+      } else if (msg.event === 'infoDelivery' && msg.info && typeof msg.info === 'object') {
+        const infoObj = msg.info as { currentTime?: number; playerState?: number };
+        if (typeof infoObj.currentTime === 'number' && Number.isFinite(infoObj.currentTime)) {
+          eduCurrentTimeRef.current = infoObj.currentTime;
+        }
+        if (infoObj.playerState === 0 && autoPlayNext && nextQueuedVideo) {
+          onSelectVideo(nextQueuedVideo.videoId);
+        }
+      } else if (msg.event === 'onStateChange' && msg.info === 0) {
+        if (autoPlayNext && nextQueuedVideo) {
+          onSelectVideo(nextQueuedVideo.videoId);
+        }
+      } else if (msg.event === 'onError') {
+        const code = Number(msg.info || 152);
+        // Rotate Classroom Edu -> Kahoot! Edu -> Server-Proxied HTML5 Stream fallback seamlessly
+        if (engineMode === 'edu-classroom' && !triedModesRef.current.has('edu-kahoot')) {
+          triedModesRef.current.add('edu-kahoot');
+          setAutoFallbackNote(`Edu 埋め込みエラー (${code}) を検知したため、Kahoot! Edu 経路へ自動切替しました`);
+          setEngineMode('edu-kahoot');
+        } else if (video && (video.formatStreams.length > 0 || video.hlsProxyUrl || video.adaptiveFormats.length > 0)) {
+          triedModesRef.current.add(engineMode);
+          setAutoFallbackNote(`Edu 制限 (エラー ${code}) のため、自前プロキシHTML5ストリームへ自動フォールバックしました`);
+          setEngineMode(video.formatStreams.length > 0 ? 'googlevideo' : 'hls');
+        } else {
+          setAutoFallbackNote(`Edu 制限 (エラー ${code}) を検知。外部 Invidious/Zernio 自動復旧を試行しています...`);
+          runExternalAutoRecovery();
+        }
+      }
+    };
+
+    window.addEventListener('message', handleEduMessage);
+    const pulse = window.setInterval(sendEduListening, 1500);
+    return () => {
+      window.removeEventListener('message', handleEduMessage);
+      window.clearInterval(pulse);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isEduMode, engineMode, videoId, playbackRate, autoPlayNext, nextQueuedVideo?.videoId]);
 
   return (
     <div className="flex flex-col gap-6">
@@ -1272,7 +1402,7 @@ export function PlayerView({
               onClick={() => checkLiveServers(true)}
               disabled={checkingLive}
               className="flex items-center gap-1.5 font-mono text-xs text-zinc-600 dark:text-zinc-300 hover:text-blue-600 dark:hover:text-blue-400 transition-colors tabular-nums"
-              title="外部 Invidious / Zernio / 7サーバーの死活を再確認"
+              title="外部 Invidious / Zernio / 10インスタンスの死活を再確認"
             >
               <Activity className={`h-3.5 w-3.5 text-emerald-500 ${checkingLive ? 'animate-pulse' : ''}`} />
               <span>
@@ -1470,17 +1600,28 @@ export function PlayerView({
             {loading || resolvingBrowser ? (
               <div className="flex h-full w-full items-center justify-center bg-zinc-900 font-mono text-xs text-zinc-400">
                 {resolvingBrowser
-                  ? '7サーバー自動フォールバック ＆ ブラウザIP経路探索中...'
-                  : '環境最適化ストリームと Edu埋め込み情報を解決中...'}
+                  ? '10インスタンス自動フォールバック ＆ 外部生存サーバー探索中...'
+                  : 'プロキシ経由ストリームと Edu埋め込み情報を解決中...'}
               </div>
             ) : isEduMode ? (
               <iframe
+                ref={eduIframeRef}
                 key={`${videoId}-${engineMode}`}
                 src={activeEduUrl}
                 title={video?.title || `Edu Player ${videoId}`}
                 allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; fullscreen; web-share"
                 referrerPolicy="strict-origin-when-cross-origin"
                 allowFullScreen
+                onLoad={() => {
+                  try {
+                    eduIframeRef.current?.contentWindow?.postMessage(
+                      JSON.stringify({ event: 'listening', id: videoId }),
+                      '*',
+                    );
+                  } catch {
+                    // ignore
+                  }
+                }}
                 className="h-full w-full border-0 bg-black"
               />
             ) : activeVideoSrc ? (
@@ -1975,28 +2116,24 @@ export function PlayerView({
               {/* トラック詳細・±10秒瞬時スキップ・先読み次動画コントローラ */}
               <div className="flex flex-wrap items-center justify-between gap-2 pt-2.5 border-t border-zinc-100 dark:border-zinc-800/80">
                 <div className="flex flex-wrap items-center gap-2">
-                  {!isEduMode && (
-                    <>
-                      <button
-                        type="button"
-                        onClick={() => performSkip(-10)}
-                        title="10秒戻す (← / J)"
-                        className="flex h-8 items-center gap-1 rounded-lg border border-zinc-200 dark:border-zinc-700 bg-zinc-50 dark:bg-zinc-950 px-2.5 font-mono text-xs font-medium text-zinc-800 dark:text-zinc-200 hover:bg-zinc-100 dark:hover:bg-zinc-800 transition-colors whitespace-nowrap"
-                      >
-                        <Rewind className="h-3.5 w-3.5" />
-                        <span>-10秒</span>
-                      </button>
-                      <button
-                        type="button"
-                        onClick={() => performSkip(10)}
-                        title="10秒進める (→ / L)"
-                        className="flex h-8 items-center gap-1 rounded-lg border border-zinc-200 dark:border-zinc-700 bg-zinc-50 dark:bg-zinc-950 px-2.5 font-mono text-xs font-medium text-zinc-800 dark:text-zinc-200 hover:bg-zinc-100 dark:hover:bg-zinc-800 transition-colors whitespace-nowrap"
-                      >
-                        <span>+10秒</span>
-                        <FastForward className="h-3.5 w-3.5" />
-                      </button>
-                    </>
-                  )}
+                  <button
+                    type="button"
+                    onClick={() => performSkip(-10)}
+                    title="10秒戻す (← / J)"
+                    className="flex h-8 items-center gap-1 rounded-lg border border-zinc-200 dark:border-zinc-700 bg-zinc-50 dark:bg-zinc-950 px-2.5 font-mono text-xs font-medium text-zinc-800 dark:text-zinc-200 hover:bg-zinc-100 dark:hover:bg-zinc-800 transition-colors whitespace-nowrap"
+                  >
+                    <Rewind className="h-3.5 w-3.5" />
+                    <span>-10秒</span>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => performSkip(10)}
+                    title="10秒進める (→ / L)"
+                    className="flex h-8 items-center gap-1 rounded-lg border border-zinc-200 dark:border-zinc-700 bg-zinc-50 dark:bg-zinc-950 px-2.5 font-mono text-xs font-medium text-zinc-800 dark:text-zinc-200 hover:bg-zinc-100 dark:hover:bg-zinc-800 transition-colors whitespace-nowrap"
+                  >
+                    <span>+10秒</span>
+                    <FastForward className="h-3.5 w-3.5" />
+                  </button>
 
                   {(engineMode === 'sync' || engineMode === 'mux') && videoTracks.length > 0 && (
                     <select

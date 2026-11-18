@@ -13,7 +13,7 @@ import { BotGuardClient } from 'bgutils-js/botguard';
 import { buildURL, parseLooseJSON, getHeaders, USER_AGENT } from 'bgutils-js/utils';
 import { WebPoMinter } from 'bgutils-js/webpo';
 import { JSDOM } from 'jsdom';
-import { ProxyAgent, Socks5ProxyAgent, fetch as undiciFetch, type Dispatcher } from 'undici';
+import { Agent, ProxyAgent, Socks5ProxyAgent, fetch as undiciFetch, type Dispatcher } from 'undici';
 import { GoogleGenAI, Type } from '@google/genai';
 import type {
   AdaptiveFormat,
@@ -128,15 +128,22 @@ const streamConfig = {
   outboundProxyUrl: (process.env.YT_PROXY_URL || process.env.HTTPS_PROXY || process.env.HTTP_PROXY || '').trim(),
 };
 
+const keepAliveDispatcher = new Agent({
+  connections: 64,
+  pipelining: 1,
+  keepAliveTimeout: 30_000,
+  keepAliveMaxTimeout: 60_000,
+});
+
 let outboundDispatcher: Dispatcher | undefined;
 let cachedProxyUrl = '';
 
-function getOutboundDispatcher(): Dispatcher | undefined {
+function getOutboundDispatcher(): Dispatcher {
   const url = streamConfig.outboundProxyUrl;
   if (!url) {
     outboundDispatcher = undefined;
     cachedProxyUrl = '';
-    return undefined;
+    return keepAliveDispatcher;
   }
   if (outboundDispatcher && cachedProxyUrl === url) {
     return outboundDispatcher;
@@ -150,15 +157,12 @@ function getOutboundDispatcher(): Dispatcher | undefined {
   } catch {
     outboundDispatcher = undefined;
     cachedProxyUrl = '';
-    return undefined;
+    return keepAliveDispatcher;
   }
 }
 
 function proxiedFetch(input: RequestInfo | URL, init?: RequestInit): Promise<Response> {
   const dispatcher = getOutboundDispatcher();
-  if (!dispatcher) {
-    return globalThis.fetch(input, init);
-  }
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   return undiciFetch(input as any, {
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -225,40 +229,35 @@ function buildEduEmbedConfig(
   author = '',
   embeddable = true,
   lang = 'ja',
+  reqOrigin?: string,
 ): EduEmbedConfig {
-  const classroomParams = new URLSearchParams({
+  const baseParams: Record<string, string> = {
+    enablejsapi: '1',
     rel: '0',
     playsinline: '1',
     iv_load_policy: '3',
     modestbranding: '1',
     hl: lang,
     cc_lang_pref: lang,
-  });
+  };
+  if (reqOrigin && /^https?:\/\//i.test(reqOrigin)) {
+    baseParams.origin = reqOrigin;
+    baseParams.widget_referrer = reqOrigin;
+  }
+
+  const classroomParams = new URLSearchParams(baseParams);
   const kahootParams = new URLSearchParams({
+    ...baseParams,
     autoplay: '1',
     controls: '1',
-    rel: '0',
-    playsinline: '1',
-    iv_load_policy: '3',
     fs: '1',
-    hl: lang,
-    cc_lang_pref: lang,
   });
-  const eduParams = new URLSearchParams({
-    rel: '0',
-    playsinline: '1',
-    iv_load_policy: '3',
-    hl: lang,
-    cc_lang_pref: lang,
-  });
+  const eduParams = new URLSearchParams(baseParams);
   const nocookieParams = new URLSearchParams({
+    ...baseParams,
     autoplay: '1',
     controls: '1',
-    rel: '0',
-    playsinline: '1',
-    iv_load_policy: '3',
     fs: '1',
-    hl: lang,
   });
 
   const baseEduUrl = `https://www.youtubeeducation.com/embed/${encodeURIComponent(videoId)}`;
@@ -272,8 +271,9 @@ function buildEduEmbedConfig(
     nocookieUrl: `https://www.youtube-nocookie.com/embed/${encodeURIComponent(videoId)}?${nocookieParams.toString()}`,
     educationUrl: `${baseEduUrl}?${eduParams.toString()}`,
     embeddable,
+    proxyFallbackAvailable: true,
     providerNote:
-      '正規 YouTube Education (youtubeeducation.com) 埋め込みエンジンを使用します。Google Classroom / Kahoot! 教育管理環境向けに最適化されています。',
+      '正規 YouTube Education (youtubeeducation.com) + IFrame API連携 + サーバープロキシEduフォールバック対応',
   };
 }
 
@@ -450,7 +450,7 @@ function getYt(): Promise<Innertube> {
         cookie: streamConfig.cookies || undefined,
         visitor_data: po?.visitorData || undefined,
         po_token: po?.coldPot || undefined,
-        fetch: streamConfig.outboundProxyUrl ? proxiedFetch : undefined,
+        fetch: proxiedFetch,
       });
       attachOAuthListeners(yt);
 
@@ -490,6 +490,14 @@ function buildThumbnails(videoId: string): VideoThumbnail[] {
     { quality: 'medium', url: `/api/v1/thumbnail/${videoId}/mqdefault`, width: 320, height: 180 },
     { quality: 'default', url: `/api/v1/thumbnail/${videoId}/default`, width: 120, height: 90 },
   ];
+}
+
+function proxyMediaUrl(rawUrl?: string): string {
+  if (!rawUrl || typeof rawUrl !== 'string') return '';
+  if (rawUrl.startsWith('/api/')) return rawUrl;
+  const normalized = rawUrl.startsWith('//') ? `https:${rawUrl}` : rawUrl;
+  if (!/^https?:\/\//i.test(normalized)) return '';
+  return `/api/v1/media-proxy?url=${encodeURIComponent(normalized)}`;
 }
 
 function parseDurationToSeconds(text?: string | number | null): number {
@@ -653,13 +661,13 @@ function mapRawVideoItem(v: any): SearchVideoItem | null {
     liveNow: Boolean(v?.is_live),
     is4k,
     authorThumbnails: authorThumb
-      ? [{ url: authorThumb, width: 68, height: 68 }]
+      ? [{ url: proxyMediaUrl(authorThumb), width: 68, height: 68 }]
       : [],
   };
 }
 
 // ---------------------------------------------------------------------------
-// Upstream Public Invidious Node Discovery & Racing
+// High-Performance Multi-Source Invidious + Zernio + Piped Live Node Engine
 // ---------------------------------------------------------------------------
 const FALLBACK_INVIDIOUS_HOSTS = [
   'inv.nadeko.net',
@@ -668,72 +676,273 @@ const FALLBACK_INVIDIOUS_HOSTS = [
   'invidious.fdn.fr',
   'invidious.perennialte.ch',
   'iv.melmac.space',
+  'yt.chocolatemoo53.com',
+  'invidious.jing.rocks',
+  'inv.tux.pizza',
+  'invidious.protokolla.fi',
+  'iv.datura.network',
+  'invidious.lunar.icu',
+  'invidious.materialio.us',
+  'invidious.snopyta.org',
 ];
+
+const CURATED_PIPED_NODES = [
+  { name: 'Piped Kavin', url: 'https://pipedapi.kavin.rocks', region: 'EU-Global' },
+  { name: 'Piped Leptons', url: 'https://pipedapi.leptons.xyz', region: 'EU-DE' },
+  { name: 'Piped AdminForge', url: 'https://pipedapi.adminforge.de', region: 'EU-DE' },
+  { name: 'Piped PrivateCoffee', url: 'https://api.piped.private.coffee', region: 'EU-AT' },
+  { name: 'Piped MooMoo', url: 'https://pipedapi.moomoo.me', region: 'US' },
+  { name: 'Piped Darkness', url: 'https://pipedapi.darkness.services', region: 'EU' },
+  { name: 'Piped ReallyAwesome', url: 'https://pipedapi.reallyaweso.me', region: 'EU' },
+  { name: 'Piped PrivacyDE', url: 'https://piped-api.privacy.com.de', region: 'EU-DE' },
+  { name: 'Piped SMNZ', url: 'https://pipedapi.smnz.de', region: 'EU-DE' },
+  { name: 'Piped Syncpundit', url: 'https://pipedapi.syncpundit.io', region: 'US' },
+  { name: 'Piped ProjectSegfault', url: 'https://api.piped.projectsegfau.lt', region: 'EU' },
+  { name: 'Piped Segfault IN', url: 'https://pipedapi.in.projectsegfau.lt', region: 'IN' },
+];
+
+const ZERNIO_DISCOVERY_BASES = [
+  { id: 'zernio-api', name: 'Zernio API (api.zernio.com)', url: 'https://api.zernio.com', region: 'Global' },
+  { id: 'zernio-web', name: 'Zernio Gateway (zernio.com)', url: 'https://zernio.com', region: 'Global' },
+  { id: 'zernio-app', name: 'Zernio Edge (app.zernio.com)', url: 'https://app.zernio.com', region: 'Global' },
+];
+
+interface ExternalNodeHealthRecord {
+  url: string;
+  category: 'invidious' | 'zernio' | 'piped';
+  alive: boolean;
+  streamVerified: boolean;
+  latencyMs: number;
+  score: number;
+  statusCode: number | null;
+  lastCheckedAt: number;
+  consecutiveFailures: number;
+  region?: string;
+  version?: string;
+  cors?: boolean;
+  note?: string;
+}
+
+const externalNodeRegistry = new Map<string, ExternalNodeHealthRecord>();
+
+function recordExternalNodeOutcome(
+  url: string,
+  category: 'invidious' | 'zernio' | 'piped',
+  ok: boolean,
+  streamVerified: boolean,
+  latencyMs: number,
+  statusCode: number | null,
+  extra?: Partial<ExternalNodeHealthRecord>,
+): void {
+  const cleanUrl = url.replace(/\/+$/, '');
+  const prev = externalNodeRegistry.get(cleanUrl);
+  const failures = ok ? 0 : (prev?.consecutiveFailures ?? 0) + 1;
+  const ewmaLatency = prev && prev.latencyMs > 0 ? Math.round(prev.latencyMs * 0.4 + latencyMs * 0.6) : latencyMs;
+
+  let score = 0;
+  if (ok) {
+    score = 55;
+    if (streamVerified) score += 35;
+    if (ewmaLatency < 400) score += 10;
+    else if (ewmaLatency < 1000) score += 6;
+    else if (ewmaLatency < 2000) score += 2;
+  } else if (statusCode === 401 || statusCode === 403) {
+    score = category === 'zernio' ? 40 : Math.max(0, 15 - failures * 5);
+  } else {
+    score = Math.max(0, (prev?.score ?? 10) - failures * 15);
+  }
+
+  externalNodeRegistry.set(cleanUrl, {
+    url: cleanUrl,
+    category,
+    alive: ok,
+    streamVerified: streamVerified || Boolean(ok && prev?.streamVerified),
+    latencyMs: ewmaLatency,
+    score: Math.min(100, Math.max(0, score)),
+    statusCode,
+    lastCheckedAt: Date.now(),
+    consecutiveFailures: failures,
+    region: extra?.region ?? prev?.region,
+    version: extra?.version ?? prev?.version,
+    cors: extra?.cors ?? prev?.cors ?? true,
+    note: extra?.note ?? prev?.note,
+  });
+}
+
+async function discoverDynamicExternalPools(customInvidiousUrl?: string, customZernioUrl?: string): Promise<{
+  invidious: { domain: string; uri: string; region: string; cors: boolean; uptimeHint: number }[];
+  piped: { name: string; url: string; region: string }[];
+  zernio: { id: string; name: string; url: string; region: string }[];
+}> {
+  const invMap = new Map<string, { domain: string; uri: string; region: string; cors: boolean; uptimeHint: number }>();
+
+  if (customInvidiousUrl && /^https?:\/\//i.test(customInvidiousUrl)) {
+    const clean = customInvidiousUrl.replace(/\/+$/, '');
+    invMap.set(clean, { domain: `${clean.replace(/^https?:\/\//, '')} (カスタム)`, uri: clean, region: 'Custom', cors: true, uptimeHint: 100 });
+  }
+  if (streamConfig.customUpstreamUrl && /^https?:\/\//i.test(streamConfig.customUpstreamUrl)) {
+    const clean = streamConfig.customUpstreamUrl.replace(/\/+$/, '');
+    invMap.set(clean, { domain: `${clean.replace(/^https?:\/\//, '')} (接続設定)`, uri: clean, region: 'Custom', cors: true, uptimeHint: 99 });
+  }
+
+  const pipedMap = new Map<string, { name: string; url: string; region: string }>();
+  for (const p of CURATED_PIPED_NODES) pipedMap.set(p.url, p);
+
+  const [invRes, pipedRes] = await Promise.allSettled([
+    proxiedFetch('https://api.invidious.io/instances.json?sort_by=health', {
+      headers: { 'User-Agent': PRIVACY_USER_AGENTS[0] },
+      signal: AbortSignal.timeout(3200),
+    }),
+    proxiedFetch('https://piped-instances.kavin.rocks', {
+      headers: { 'User-Agent': PRIVACY_USER_AGENTS[0] },
+      signal: AbortSignal.timeout(3200),
+    }),
+  ]);
+
+  if (invRes.status === 'fulfilled' && invRes.value.ok) {
+    try {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const list = (await invRes.value.json()) as [string, any][];
+      for (const [domain, meta] of list) {
+        if (meta?.type === 'https' && meta?.api) {
+          const uri = String(meta.uri || `https://${domain}`).replace(/\/+$/, '');
+          const ratio = Number(meta?.monitor?.['30dRatio']?.ratio ?? meta?.monitor?.['7dRatio']?.ratio ?? 90);
+          if (!invMap.has(uri)) {
+            invMap.set(uri, {
+              domain,
+              uri,
+              region: String(meta.region || 'Global'),
+              cors: Boolean(meta.cors),
+              uptimeHint: Number.isFinite(ratio) ? ratio : 85,
+            });
+          }
+          if (invMap.size >= 30) break;
+        }
+      }
+    } catch {
+      // ignore json error
+    }
+  }
+
+  if (pipedRes.status === 'fulfilled' && pipedRes.value.ok) {
+    try {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const list = (await pipedRes.value.json()) as any[];
+      if (Array.isArray(list)) {
+        for (const item of list) {
+          const apiUrl = typeof item?.api_url === 'string' ? item.api_url.replace(/\/+$/, '') : '';
+          if (apiUrl.startsWith('https://') && !pipedMap.has(apiUrl)) {
+            pipedMap.set(apiUrl, {
+              name: String(item.name || apiUrl.replace(/^https?:\/\//, '')),
+              url: apiUrl,
+              region: String(item.locations || 'Global'),
+            });
+          }
+          if (pipedMap.size >= 20) break;
+        }
+      }
+    } catch {
+      // ignore json error
+    }
+  }
+
+  for (const host of FALLBACK_INVIDIOUS_HOSTS) {
+    const uri = `https://${host}`;
+    if (!invMap.has(uri)) {
+      invMap.set(uri, { domain: host, uri, region: 'Global', cors: true, uptimeHint: 75 });
+    }
+  }
+
+  const zernio = [...ZERNIO_DISCOVERY_BASES];
+  if (customZernioUrl && /^https?:\/\//i.test(customZernioUrl)) {
+    const clean = customZernioUrl.replace(/\/+$/, '');
+    zernio.unshift({
+      id: 'zernio-custom',
+      name: `カスタム Zernio サーバー (${clean.replace(/^https?:\/\//, '')})`,
+      url: clean,
+      region: 'Custom',
+    });
+  }
+
+  return {
+    invidious: [...invMap.values()],
+    piped: [...pipedMap.values()],
+    zernio,
+  };
+}
+
+function getRankedExternalCandidates(category: 'invidious' | 'zernio' | 'piped', fallbackUrls: string[]): string[] {
+  const combined = new Set<string>(fallbackUrls.map((u) => u.replace(/\/+$/, '')));
+  for (const rec of externalNodeRegistry.values()) {
+    if (rec.category === category && (rec.alive || rec.streamVerified)) {
+      combined.add(rec.url);
+    }
+  }
+  return [...combined].sort((a, b) => {
+    const ra = externalNodeRegistry.get(a);
+    const rb = externalNodeRegistry.get(b);
+    const sa = ra ? (ra.streamVerified ? 200 : 0) + ra.score : 30;
+    const sb = rb ? (rb.streamVerified ? 200 : 0) + rb.score : 30;
+    if (sb !== sa) return sb - sa;
+    return (ra?.latencyMs ?? 1500) - (rb?.latencyMs ?? 1500);
+  });
+}
 
 async function discoverUpstreamNodes(): Promise<InstanceNode[]> {
   const cached = cacheGet<InstanceNode[]>('instances:list');
   if (cached.hit && !cached.stale && cached.data) return cached.data;
 
-  let candidates: { domain: string; uri: string; region: string; type: string; apiEnabled: boolean; cors: boolean }[] = [];
-
-  try {
-    const res = await fetch('https://api.invidious.io/instances.json?sort_by=health', {
-      signal: AbortSignal.timeout(3500),
-    });
-    if (res.ok) {
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      const list = (await res.json()) as [string, any][];
-      candidates = list
-        .filter(([, meta]) => meta?.type === 'https' && meta?.api)
-        .slice(0, 8)
-        .map(([domain, meta]) => ({
-          domain,
-          uri: meta.uri || `https://${domain}`,
-          region: meta.region || 'Global',
-          type: meta.type || 'https',
-          apiEnabled: Boolean(meta.api),
-          cors: Boolean(meta.cors),
-        }));
-    }
-  } catch {
-    // Fall back to curated defaults
-  }
-
-  for (const host of FALLBACK_INVIDIOUS_HOSTS) {
-    if (!candidates.some((c) => c.domain === host)) {
-      candidates.push({
-        domain: host,
-        uri: `https://${host}`,
-        region: 'EU/US',
-        type: 'https',
-        apiEnabled: true,
-        cors: true,
-      });
-    }
-  }
-
+  const pools = await discoverDynamicExternalPools();
   const probed = await Promise.all(
-    candidates.slice(0, 8).map(async (node): Promise<InstanceNode> => {
+    pools.invidious.slice(0, 12).map(async (node): Promise<InstanceNode> => {
       const t0 = performance.now();
       try {
-        const res = await fetch(`${node.uri}/api/v1/stats`, {
+        const res = await proxiedFetch(`${node.uri}/api/v1/stats`, {
+          headers: { 'User-Agent': PRIVACY_USER_AGENTS[0] },
           signal: AbortSignal.timeout(2500),
         });
         const latencyMs = Math.round(performance.now() - t0);
         if (!res.ok) {
-          return { ...node, status: 'degraded', latencyMs };
+          recordExternalNodeOutcome(node.uri, 'invidious', false, false, latencyMs, res.status, { region: node.region, cors: node.cors });
+          return {
+            domain: node.domain,
+            uri: node.uri,
+            region: node.region,
+            type: 'https',
+            apiEnabled: true,
+            cors: node.cors,
+            status: 'degraded',
+            latencyMs,
+          };
         }
         // eslint-disable-next-line @typescript-eslint/no-explicit-any
         const json = (await res.json()) as any;
+        const ver = json?.software?.version || '2.x';
+        recordExternalNodeOutcome(node.uri, 'invidious', true, false, latencyMs, res.status, {
+          region: node.region,
+          cors: node.cors,
+          version: ver,
+        });
         return {
-          ...node,
+          domain: node.domain,
+          uri: node.uri,
+          region: node.region,
+          type: 'https',
+          apiEnabled: true,
+          cors: node.cors,
           status: latencyMs < 1200 ? 'online' : 'degraded',
           latencyMs,
-          version: json?.software?.version || '2.x',
+          version: ver,
         };
       } catch {
+        recordExternalNodeOutcome(node.uri, 'invidious', false, false, 2500, null, { region: node.region, cors: node.cors });
         return {
-          ...node,
+          domain: node.domain,
+          uri: node.uri,
+          region: node.region,
+          type: 'https',
+          apiEnabled: true,
+          cors: node.cors,
           status: 'offline',
           latencyMs: null,
         };
@@ -742,15 +951,15 @@ async function discoverUpstreamNodes(): Promise<InstanceNode[]> {
   );
 
   const selfNode: InstanceNode = {
-    domain: '0.0.0.0:3000 → 127.0.0.1:3001 (自前オリジン保護)',
+    domain: '0.0.0.0:3000 → 127.0.0.1:3001-3010 (10インスタンス保護)',
     uri: '',
-    region: 'JP-Edge (Proxy Shield)',
+    region: 'JP-Edge (10-Node Proxy Cluster)',
     type: 'https',
     apiEnabled: true,
     cors: true,
     status: 'online',
     latencyMs: 1,
-    version: '2.6.0-kuro-4k',
+    version: '2.7.0-kuro-10x',
     isSelf: true,
   };
 
@@ -759,39 +968,43 @@ async function discoverUpstreamNodes(): Promise<InstanceNode[]> {
   return finalNodes;
 }
 
-// Race custom upstream + external Invidious/Piped nodes for raw adaptive 4K stream URLs
-async function raceInvidiousVideoNode(videoId: string): Promise<Partial<VideoResponse> | null> {
-  const candidates: string[] = [];
-  if (streamConfig.customUpstreamUrl) {
-    candidates.push(streamConfig.customUpstreamUrl);
-  }
-  for (const host of FALLBACK_INVIDIOUS_HOSTS.slice(0, 4)) {
-    candidates.push(`https://${host}`);
-  }
+// Proxy-First External Invidious + Piped + Zernio Video/Search/Comments/Channel Extractors
+async function fetchVideoViaExternalProxy(videoId: string): Promise<Partial<VideoResponse> | null> {
+  const defaultInv = [
+    ...(streamConfig.customUpstreamUrl ? [streamConfig.customUpstreamUrl] : []),
+    ...FALLBACK_INVIDIOUS_HOSTS.slice(0, 8).map((h) => `https://${h}`),
+  ];
+  const invCandidates = getRankedExternalCandidates('invidious', defaultInv).slice(0, 8);
+  const pipedCandidates = getRankedExternalCandidates(
+    'piped',
+    CURATED_PIPED_NODES.slice(0, 6).map((p) => p.url),
+  ).slice(0, 5);
 
-  try {
-    const winner = await Promise.any(
-      candidates.map(async (baseUrl) => {
-        const res = await proxiedFetch(`${baseUrl}/api/v1/videos/${encodeURIComponent(videoId)}`, {
-          headers: { 'User-Agent': 'KuroStream-Gateway/1.0' },
-          signal: AbortSignal.timeout(2500),
-        });
-        if (!res.ok) throw new Error(`HTTP ${res.status}`);
-        // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        const data = (await res.json()) as any;
-        if (!data || !data.title || (!data.adaptiveFormats?.length && !data.formatStreams?.length)) {
-          throw new Error('Incomplete stream payload');
-        }
-        return { host: baseUrl.replace(/^https?:\/\//, ''), data };
-      }),
-    );
+  const invTasks = invCandidates.map(async (baseUrl) => {
+    const t0 = performance.now();
+    const res = await proxiedFetch(`${baseUrl}/api/v1/videos/${encodeURIComponent(videoId)}`, {
+      headers: { 'User-Agent': PRIVACY_USER_AGENTS[0] },
+      signal: AbortSignal.timeout(3000),
+    });
+    const ms = Math.round(performance.now() - t0);
+    if (!res.ok) {
+      recordExternalNodeOutcome(baseUrl, 'invidious', false, false, ms, res.status);
+      throw new Error(`HTTP ${res.status}`);
+    }
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const data = (await res.json()) as any;
+    const hasMeta = Boolean(data && data.title);
+    const hasStreams = Boolean(data?.adaptiveFormats?.length || data?.formatStreams?.length || data?.hlsUrl);
+    if (!hasMeta && !hasStreams) throw new Error('Incomplete payload');
+    recordExternalNodeOutcome(baseUrl, 'invidious', true, hasStreams, ms, res.status);
 
-    const rawAdaptive: AdaptiveFormat[] = (winner.data.adaptiveFormats || []).map(
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const rawAdaptive: AdaptiveFormat[] = (data.adaptiveFormats || []).filter((f: any) => f?.url).map(
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       (f: any): AdaptiveFormat => ({
         bitrate: String(f.bitrate || '0'),
-        url: f.url,
-        proxyUrl: `/latest_version?id=${encodeURIComponent(videoId)}&itag=${encodeURIComponent(f.itag)}`,
+        url: String(f.url),
+        proxyUrl: `/latest_version?id=${encodeURIComponent(videoId)}&itag=${encodeURIComponent(String(f.itag || ''))}`,
         itag: String(f.itag || ''),
         type: String(f.type || ''),
         container: String(f.container || 'webm'),
@@ -804,11 +1017,12 @@ async function raceInvidiousVideoNode(videoId: string): Promise<Partial<VideoRes
       }),
     );
 
-    const rawFormats: FormatStream[] = (winner.data.formatStreams || []).map(
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const rawFormats: FormatStream[] = (data.formatStreams || []).filter((f: any) => f?.url).map(
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       (f: any): FormatStream => ({
-        url: f.url,
-        proxyUrl: `/latest_version?id=${encodeURIComponent(videoId)}&itag=${encodeURIComponent(f.itag)}`,
+        url: String(f.url),
+        proxyUrl: `/api/v1/stream/googlevideo/${encodeURIComponent(videoId)}?itag=${encodeURIComponent(String(f.itag || ''))}`,
         itag: String(f.itag || ''),
         type: String(f.type || ''),
         quality: String(f.quality || ''),
@@ -819,15 +1033,395 @@ async function raceInvidiousVideoNode(videoId: string): Promise<Partial<VideoRes
       }),
     );
 
+    const recommendedVideos: RecommendedVideo[] = (Array.isArray(data.recommendedVideos) ? data.recommendedVideos : [])
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      .filter((r: any) => r?.videoId && r.videoId !== videoId)
+      .slice(0, 20)
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      .map((r: any): RecommendedVideo => ({
+        videoId: String(r.videoId),
+        title: String(r.title || 'Untitled Video'),
+        videoThumbnails: buildThumbnails(String(r.videoId)),
+        author: String(r.author || 'YouTube Creator'),
+        authorId: String(r.authorId || ''),
+        lengthSeconds: Number(r.lengthSeconds || 0),
+        viewCountText: String(r.viewCountText || formatViewsLabel(Number(r.viewCount || 0))),
+        viewCount: Number(r.viewCount || 0),
+      }));
+
     return {
+      title: data.title ? String(data.title) : undefined,
+      author: data.author ? String(data.author) : undefined,
+      authorId: data.authorId ? String(data.authorId) : undefined,
+      description: data.description ? String(data.description) : undefined,
+      viewCount: typeof data.viewCount === 'number' ? data.viewCount : undefined,
+      lengthSeconds: typeof data.lengthSeconds === 'number' ? data.lengthSeconds : undefined,
+      publishedText: data.publishedText ? String(data.publishedText) : undefined,
+      authorThumbnails: data.authorThumbnails?.[0]?.url
+        ? [{ url: proxyMediaUrl(String(data.authorThumbnails[0].url)), width: 88, height: 88 }]
+        : undefined,
+      recommendedVideos,
       adaptiveFormats: rawAdaptive,
       formatStreams: rawFormats,
-      directStreamAvailable: rawAdaptive.length > 0 || rawFormats.length > 0,
-      upstreamSource: `invidious-race:${winner.host}`,
-    };
+      hlsManifestUrl: typeof data.hlsUrl === 'string' && data.hlsUrl ? data.hlsUrl : undefined,
+      directStreamAvailable: rawAdaptive.length > 0 || rawFormats.length > 0 || Boolean(data.hlsUrl),
+      upstreamSource: `invidious-proxy:${baseUrl.replace(/^https?:\/\//, '')}`,
+    } as Partial<VideoResponse>;
+  });
+
+  const pipedTasks = pipedCandidates.map(async (baseUrl) => {
+    const t0 = performance.now();
+    const res = await proxiedFetch(`${baseUrl}/streams/${encodeURIComponent(videoId)}`, {
+      headers: { 'User-Agent': PRIVACY_USER_AGENTS[0] },
+      signal: AbortSignal.timeout(3000),
+    });
+    const ms = Math.round(performance.now() - t0);
+    if (!res.ok) {
+      recordExternalNodeOutcome(baseUrl, 'piped', false, false, ms, res.status);
+      throw new Error(`HTTP ${res.status}`);
+    }
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const d = (await res.json()) as any;
+    const vList = Array.isArray(d?.videoStreams) ? d.videoStreams : [];
+    const aList = Array.isArray(d?.audioStreams) ? d.audioStreams : [];
+    const hlsUrl = typeof d?.hls === 'string' && d.hls ? d.hls : undefined;
+    if (!d?.title && !vList.length && !aList.length && !hlsUrl) throw new Error('Empty Piped response');
+    const hasStreams = vList.length > 0 || aList.length > 0 || Boolean(hlsUrl);
+    recordExternalNodeOutcome(baseUrl, 'piped', true, hasStreams, ms, res.status);
+
+    const formatStreams: FormatStream[] = vList
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      .filter((v: any) => !v.videoOnly && v.url)
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      .map((v: any) => ({
+        url: String(v.url),
+        proxyUrl: `/api/v1/stream/googlevideo/${encodeURIComponent(videoId)}?itag=${encodeURIComponent(String(v.itag || v.quality || '22'))}`,
+        itag: String(v.itag || v.quality || '22'),
+        type: String(v.mimeType || 'video/mp4'),
+        quality: String(v.quality || ''),
+        container: String(v.format || 'mp4').toLowerCase(),
+        encoding: String(v.codec || 'h264'),
+        qualityLabel: String(v.quality || ''),
+        resolution: String(v.quality || ''),
+      }));
+
+    const adaptiveFormats: AdaptiveFormat[] = [
+      ...vList
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        .filter((v: any) => v.videoOnly && v.url)
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        .map((v: any) => ({
+          bitrate: String(v.bitrate || '0'),
+          url: String(v.url),
+          proxyUrl: `/latest_version?id=${encodeURIComponent(videoId)}&itag=${encodeURIComponent(String(v.itag || `v_${v.quality}`))}`,
+          itag: String(v.itag || `v_${v.quality}`),
+          type: String(v.mimeType || 'video/mp4'),
+          container: String(v.format || 'mp4').toLowerCase(),
+          encoding: String(v.codec || ''),
+          qualityLabel: String(v.quality || ''),
+          resolution: String(v.quality || ''),
+          fps: typeof v.fps === 'number' ? v.fps : undefined,
+        })),
+      ...aList
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        .filter((a: any) => a.url)
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        .map((a: any) => ({
+          bitrate: String(a.bitrate || '0'),
+          url: String(a.url),
+          proxyUrl: `/latest_version?id=${encodeURIComponent(videoId)}&itag=${encodeURIComponent(String(a.itag || `a_${a.bitrate}`))}`,
+          itag: String(a.itag || `a_${a.bitrate}`),
+          type: String(a.mimeType || 'audio/mp4'),
+          container: String(a.format || 'm4a').toLowerCase(),
+          encoding: String(a.codec || 'opus'),
+          qualityLabel: String(a.quality || 'Audio'),
+          resolution: '',
+          audioQuality: String(a.quality || 'AUDIO_QUALITY_MEDIUM'),
+        })),
+    ];
+
+    const recommendedVideos: RecommendedVideo[] = (Array.isArray(d.relatedStreams) ? d.relatedStreams : [])
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      .filter((r: any) => typeof r?.url === 'string' && r.url.includes('v='))
+      .slice(0, 20)
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      .map((r: any): RecommendedVideo => {
+        const rid = String(r.url).split('v=')[1]?.split('&')[0] || '';
+        return {
+          videoId: rid,
+          title: String(r.title || 'Untitled Video'),
+          videoThumbnails: buildThumbnails(rid),
+          author: String(r.uploaderName || 'YouTube Creator'),
+          authorId: typeof r.uploaderUrl === 'string' ? r.uploaderUrl.split('/').pop() || '' : '',
+          lengthSeconds: Number(r.duration || 0),
+          viewCountText: formatViewsLabel(Number(r.views || 0)),
+          viewCount: Number(r.views || 0),
+        };
+      })
+      .filter((r: RecommendedVideo) => /^[a-zA-Z0-9_-]{6,20}$/.test(r.videoId) && r.videoId !== videoId);
+
+    return {
+      title: d.title ? String(d.title) : undefined,
+      author: d.uploader ? String(d.uploader) : undefined,
+      authorId: typeof d.uploaderUrl === 'string' ? d.uploaderUrl.split('/').pop() || '' : undefined,
+      description: d.description ? String(d.description) : undefined,
+      viewCount: typeof d.views === 'number' ? d.views : undefined,
+      lengthSeconds: typeof d.duration === 'number' ? d.duration : undefined,
+      publishedText: d.uploadDate ? String(d.uploadDate) : undefined,
+      authorThumbnails: d.uploaderAvatar
+        ? [{ url: proxyMediaUrl(String(d.uploaderAvatar)), width: 88, height: 88 }]
+        : undefined,
+      recommendedVideos,
+      adaptiveFormats,
+      formatStreams,
+      hlsManifestUrl: hlsUrl,
+      directStreamAvailable: hasStreams,
+      upstreamSource: `piped-proxy:${baseUrl.replace(/^https?:\/\//, '')}`,
+    } as Partial<VideoResponse>;
+  });
+
+  try {
+    return await Promise.any([...invTasks, ...pipedTasks]);
   } catch {
     return null;
   }
+}
+
+async function searchViaExternalProxy(q: string, type = 'video', sortBy = 'relevance'): Promise<SearchVideoItem[]> {
+  const invCandidates = getRankedExternalCandidates(
+    'invidious',
+    FALLBACK_INVIDIOUS_HOSTS.slice(0, 6).map((h) => `https://${h}`),
+  ).slice(0, 5);
+  const pipedCandidates = getRankedExternalCandidates(
+    'piped',
+    CURATED_PIPED_NODES.slice(0, 5).map((p) => p.url),
+  ).slice(0, 4);
+
+  const tasks: Promise<SearchVideoItem[]>[] = [
+    ...invCandidates.map(async (baseUrl) => {
+      const res = await proxiedFetch(
+        `${baseUrl}/api/v1/search?q=${encodeURIComponent(q)}&type=${encodeURIComponent(type)}&sort_by=${encodeURIComponent(sortBy)}`,
+        { headers: { 'User-Agent': PRIVACY_USER_AGENTS[0] }, signal: AbortSignal.timeout(3000) },
+      );
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const arr = (await res.json()) as any[];
+      if (!Array.isArray(arr) || arr.length === 0) throw new Error('empty');
+      return arr
+        .filter((item) => item?.videoId)
+        .slice(0, 24)
+        .map((item): SearchVideoItem => ({
+          type: 'video',
+          title: String(item.title || 'Untitled Video'),
+          videoId: String(item.videoId),
+          author: String(item.author || 'YouTube Creator'),
+          authorId: String(item.authorId || ''),
+          authorUrl: item.authorId ? `/channel/${item.authorId}` : '',
+          authorVerified: Boolean(item.authorVerified),
+          videoThumbnails: buildThumbnails(String(item.videoId)),
+          description: String(item.description || ''),
+          descriptionHtml: textToHtml(item.description || ''),
+          viewCount: Number(item.viewCount || 0),
+          viewCountText: String(item.viewCountText || formatViewsLabel(Number(item.viewCount || 0))),
+          published: Number(item.published || Math.floor(Date.now() / 1000)),
+          publishedText: String(item.publishedText || ''),
+          lengthSeconds: Number(item.lengthSeconds || 0),
+          liveNow: Boolean(item.liveNow),
+          is4k: /\b(4k|8k|2160p|uhd|hdr)\b/i.test(String(item.title || '')),
+          authorThumbnails: [],
+        }));
+    }),
+    ...pipedCandidates.map(async (baseUrl) => {
+      const res = await proxiedFetch(
+        `${baseUrl}/search?q=${encodeURIComponent(q)}&filter=videos`,
+        { headers: { 'User-Agent': PRIVACY_USER_AGENTS[0] }, signal: AbortSignal.timeout(3000) },
+      );
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const d = (await res.json()) as any;
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const items: any[] = Array.isArray(d?.items) ? d.items : [];
+      if (items.length === 0) throw new Error('empty');
+      return items
+        .filter((it) => typeof it?.url === 'string' && it.url.includes('v='))
+        .slice(0, 24)
+        .map((it): SearchVideoItem => {
+          const vid = String(it.url).split('v=')[1]?.split('&')[0] || '';
+          return {
+            type: 'video',
+            title: String(it.title || 'Untitled Video'),
+            videoId: vid,
+            author: String(it.uploaderName || 'YouTube Creator'),
+            authorId: typeof it.uploaderUrl === 'string' ? it.uploaderUrl.split('/').pop() || '' : '',
+            authorUrl: '',
+            authorVerified: Boolean(it.uploaderVerified),
+            videoThumbnails: buildThumbnails(vid),
+            description: String(it.shortDescription || ''),
+            descriptionHtml: textToHtml(it.shortDescription || ''),
+            viewCount: Number(it.views || 0),
+            viewCountText: formatViewsLabel(Number(it.views || 0)),
+            published: Math.floor(Date.now() / 1000),
+            publishedText: String(it.uploadedDate || ''),
+            lengthSeconds: Number(it.duration || 0),
+            liveNow: Number(it.duration) <= 0,
+            is4k: /\b(4k|8k|2160p|uhd|hdr)\b/i.test(String(it.title || '')),
+            authorThumbnails: it.uploaderAvatar
+              ? [{ url: proxyMediaUrl(String(it.uploaderAvatar)), width: 68, height: 68 }]
+              : [],
+          };
+        })
+        .filter((x) => /^[a-zA-Z0-9_-]{6,20}$/.test(x.videoId));
+    }),
+  ];
+
+  try {
+    return await Promise.any(tasks);
+  } catch {
+    return [];
+  }
+}
+
+async function fetchCommentsViaExternalProxy(videoId: string): Promise<CommentsResponse | null> {
+  const invCandidates = getRankedExternalCandidates(
+    'invidious',
+    FALLBACK_INVIDIOUS_HOSTS.slice(0, 5).map((h) => `https://${h}`),
+  ).slice(0, 4);
+  const pipedCandidates = getRankedExternalCandidates(
+    'piped',
+    CURATED_PIPED_NODES.slice(0, 4).map((p) => p.url),
+  ).slice(0, 3);
+
+  try {
+    return await Promise.any([
+      ...invCandidates.map(async (baseUrl): Promise<CommentsResponse> => {
+        const res = await proxiedFetch(`${baseUrl}/api/v1/comments/${encodeURIComponent(videoId)}`, {
+          headers: { 'User-Agent': PRIVACY_USER_AGENTS[0] },
+          signal: AbortSignal.timeout(3000),
+        });
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const d = (await res.json()) as any;
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const list: CommentItem[] = (Array.isArray(d?.comments) ? d.comments : []).map((c: any, idx: number) => ({
+          author: String(c.author || 'Anonymous'),
+          authorThumbnails: c.authorThumbnails?.[0]?.url
+            ? [{ url: proxyMediaUrl(String(c.authorThumbnails[0].url)), width: 48, height: 48 }]
+            : [],
+          authorId: String(c.authorId || ''),
+          authorUrl: c.authorId ? `/channel/${c.authorId}` : '',
+          isEdited: Boolean(c.isEdited),
+          content: String(c.content || ''),
+          contentHtml: textToHtml(c.content || ''),
+          published: Number(c.published || Math.floor(Date.now() / 1000)),
+          publishedText: String(c.publishedText || ''),
+          likeCount: Number(c.likeCount || 0),
+          commentId: String(c.commentId || `${videoId}_inv_${idx}`),
+          authorIsChannelOwner: Boolean(c.authorIsChannelOwner),
+        }));
+        if (!list.length) throw new Error('empty');
+        return { commentCount: Number(d.commentCount || list.length), videoId, comments: list };
+      }),
+      ...pipedCandidates.map(async (baseUrl): Promise<CommentsResponse> => {
+        const res = await proxiedFetch(`${baseUrl}/comments/${encodeURIComponent(videoId)}`, {
+          headers: { 'User-Agent': PRIVACY_USER_AGENTS[0] },
+          signal: AbortSignal.timeout(3000),
+        });
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const d = (await res.json()) as any;
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const list: CommentItem[] = (Array.isArray(d?.comments) ? d.comments : []).map((c: any, idx: number) => ({
+          author: String(c.author || 'Anonymous'),
+          authorThumbnails: c.thumbnail
+            ? [{ url: proxyMediaUrl(String(c.thumbnail)), width: 48, height: 48 }]
+            : [],
+          authorId: typeof c.commentorUrl === 'string' ? c.commentorUrl.split('/').pop() || '' : '',
+          authorUrl: '',
+          isEdited: false,
+          content: String(c.commentText || ''),
+          contentHtml: textToHtml(c.commentText || ''),
+          published: Math.floor(Date.now() / 1000),
+          publishedText: String(c.commentedTime || ''),
+          likeCount: Number(c.likeCount || 0),
+          commentId: String(c.commentId || `${videoId}_pip_${idx}`),
+          authorIsChannelOwner: Boolean(c.hearted),
+        }));
+        if (!list.length) throw new Error('empty');
+        return { commentCount: list.length, videoId, comments: list };
+      }),
+    ]);
+  } catch {
+    return null;
+  }
+}
+
+async function fetchChannelViaExternalProxy(channelId: string): Promise<ChannelResponse | null> {
+  const invCandidates = getRankedExternalCandidates(
+    'invidious',
+    FALLBACK_INVIDIOUS_HOSTS.slice(0, 5).map((h) => `https://${h}`),
+  ).slice(0, 4);
+  try {
+    return await Promise.any(
+      invCandidates.map(async (baseUrl): Promise<ChannelResponse> => {
+        const res = await proxiedFetch(`${baseUrl}/api/v1/channels/${encodeURIComponent(channelId)}`, {
+          headers: { 'User-Agent': PRIVACY_USER_AGENTS[0] },
+          signal: AbortSignal.timeout(3200),
+        });
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const ch = (await res.json()) as any;
+        if (!ch?.author) throw new Error('empty');
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const latestVideos: SearchVideoItem[] = (Array.isArray(ch.latestVideos) ? ch.latestVideos : []).slice(0, 24).map((v: any) => ({
+          type: 'video',
+          title: String(v.title || 'Untitled Video'),
+          videoId: String(v.videoId || ''),
+          author: String(ch.author),
+          authorId: channelId,
+          authorUrl: `/channel/${channelId}`,
+          authorVerified: Boolean(ch.authorVerified),
+          videoThumbnails: buildThumbnails(String(v.videoId || '')),
+          description: '',
+          descriptionHtml: '',
+          viewCount: Number(v.viewCount || 0),
+          viewCountText: String(v.viewCountText || formatViewsLabel(Number(v.viewCount || 0))),
+          published: Number(v.published || Math.floor(Date.now() / 1000)),
+          publishedText: String(v.publishedText || ''),
+          lengthSeconds: Number(v.lengthSeconds || 0),
+          liveNow: Boolean(v.liveNow),
+          is4k: /\b(4k|8k|2160p|uhd|hdr)\b/i.test(String(v.title || '')),
+          authorThumbnails: [],
+        }));
+        return {
+          author: String(ch.author),
+          authorId: channelId,
+          authorUrl: `/channel/${channelId}`,
+          authorBanners: ch.authorBanners?.[0]?.url
+            ? [{ url: proxyMediaUrl(String(ch.authorBanners[0].url)), width: 1280, height: 240 }]
+            : [],
+          authorThumbnails: ch.authorThumbnails?.[0]?.url
+            ? [{ url: proxyMediaUrl(String(ch.authorThumbnails[0].url)), width: 176, height: 176 }]
+            : [],
+          subCount: Number(ch.subCount || 0),
+          subCountText: String(ch.subCountText || ''),
+          totalViews: Number(ch.totalViews || 0),
+          joined: Number(ch.joined || 0),
+          autoGenerated: false,
+          isFamilyFriendly: Boolean(ch.isFamilyFriendly ?? true),
+          description: String(ch.description || ''),
+          descriptionHtml: textToHtml(ch.description || ''),
+          latestVideos,
+        };
+      }),
+    );
+  } catch {
+    return null;
+  }
+}
+
+// Keep alias for compatibility with existing calls
+async function raceInvidiousVideoNode(videoId: string): Promise<Partial<VideoResponse> | null> {
+  return fetchVideoViaExternalProxy(videoId);
 }
 
 async function extractDirectInnertubeStreams(
@@ -945,42 +1539,46 @@ async function extractDirectInnertubeStreams(
 }
 
 // ---------------------------------------------------------------------------
-// Core Video Extractor (Parallel InnerTube + oEmbed + Invidious Race)
+// Core Video Extractor (Proxy-First Multi-Relay + InnerTube + oEmbed)
 // ---------------------------------------------------------------------------
 async function fetchVideoFull(videoId: string): Promise<VideoResponse> {
-  const yt = await getYt();
+  const ytPromiseLocal = getYt().catch(() => null);
 
-  const [infoResult, oembedResult, invidiousRaceResult, directStreamResult] = await Promise.allSettled([
-    yt.getInfo(videoId),
-    fetch(`https://www.youtube.com/oembed?url=https://www.youtube.com/watch?v=${encodeURIComponent(videoId)}&format=json`, {
-      signal: AbortSignal.timeout(3000),
-    }).then((r) => (r.ok ? r.json() : null)),
-    raceInvidiousVideoNode(videoId),
-    extractDirectInnertubeStreams(yt, videoId),
+  const [infoResult, oembedResult, externalProxyResult, directStreamResult] = await Promise.allSettled([
+    ytPromiseLocal.then((yt) => (yt ? yt.getInfo(videoId) : null)),
+    proxiedFetch(
+      `https://www.youtube.com/oembed?url=https://www.youtube.com/watch?v=${encodeURIComponent(videoId)}&format=json`,
+      { headers: { 'User-Agent': PRIVACY_USER_AGENTS[0] }, signal: AbortSignal.timeout(2800) },
+    ).then((r) => (r.ok ? r.json() : null)),
+    fetchVideoViaExternalProxy(videoId),
+    ytPromiseLocal.then((yt) => (yt ? extractDirectInnertubeStreams(yt, videoId) : null)),
   ]);
 
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const info: any = infoResult.status === 'fulfilled' ? infoResult.value : null;
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const oembed: any = oembedResult.status === 'fulfilled' ? oembedResult.value : null;
-  const raceData = invidiousRaceResult.status === 'fulfilled' ? invidiousRaceResult.value : null;
+  const raceData = externalProxyResult.status === 'fulfilled' ? externalProxyResult.value : null;
   const directData = directStreamResult.status === 'fulfilled' ? directStreamResult.value : null;
 
   const title =
     info?.primary_info?.title?.text ||
     info?.basic_info?.title ||
+    raceData?.title ||
     oembed?.title ||
     `Video ${videoId}`;
 
   const author =
     info?.secondary_info?.owner?.author?.name ||
     info?.basic_info?.author ||
+    raceData?.author ||
     oembed?.author_name ||
     'YouTube Creator';
 
   const authorId =
     info?.secondary_info?.owner?.author?.id ||
     info?.basic_info?.channel_id ||
+    raceData?.authorId ||
     '';
 
   const authorThumb =
@@ -996,17 +1594,21 @@ async function fetchVideoFull(videoId: string): Promise<VideoResponse> {
 
   const viewCount =
     info?.basic_info?.view_count ||
+    raceData?.viewCount ||
     parseViewCount(viewText);
 
   const publishedText =
-    info?.primary_info?.published?.text || '';
+    info?.primary_info?.published?.text ||
+    raceData?.publishedText ||
+    '';
 
   const description =
     info?.secondary_info?.description?.text ||
     info?.basic_info?.short_description ||
+    raceData?.description ||
     '';
 
-  // Extract recommended videos from watch_next_feed (now includes LockupView)
+  // Extract recommended videos from watch_next_feed (LockupView) OR external proxy node
   const recommendedRaw = Array.isArray(info?.watch_next_feed) ? info.watch_next_feed : [];
   const recommendedVideos: RecommendedVideo[] = [];
   const seenRecIds = new Set<string>([videoId]);
@@ -1028,12 +1630,23 @@ async function fetchVideoFull(videoId: string): Promise<VideoResponse> {
     if (recommendedVideos.length >= 20) break;
   }
 
-  // Fallback search for related videos if watch_next_feed returned fewer than 8
+  for (const r of raceData?.recommendedVideos || []) {
+    if (!seenRecIds.has(r.videoId)) {
+      seenRecIds.add(r.videoId);
+      recommendedVideos.push(r);
+    }
+    if (recommendedVideos.length >= 20) break;
+  }
+
+  // Fallback search for related videos via proxy/InnerTube if fewer than 8
   if (recommendedVideos.length < 8) {
     const fallbackQuery =
       (title && !title.startsWith('Video ') ? title.slice(0, 60) : '') ||
       (author && author !== 'YouTube Creator' ? author : '4K HDR Japan');
-    const relSearch = await yt.search(fallbackQuery, { type: 'video', prioritize: 'relevance' }).catch(() => null);
+    const yt = await ytPromiseLocal;
+    const relSearch = yt
+      ? await yt.search(fallbackQuery, { type: 'video', prioritize: 'relevance' }).catch(() => null)
+      : null;
     for (const v of relSearch?.videos || []) {
       const mapped = mapRawVideoItem(v);
       if (mapped && !seenRecIds.has(mapped.videoId)) {
@@ -1051,12 +1664,32 @@ async function fetchVideoFull(videoId: string): Promise<VideoResponse> {
       }
       if (recommendedVideos.length >= 20) break;
     }
+    if (recommendedVideos.length < 8) {
+      const proxyRel = await searchViaExternalProxy(fallbackQuery, 'video', 'relevance');
+      for (const mapped of proxyRel) {
+        if (!seenRecIds.has(mapped.videoId)) {
+          seenRecIds.add(mapped.videoId);
+          recommendedVideos.push({
+            videoId: mapped.videoId,
+            title: mapped.title,
+            videoThumbnails: mapped.videoThumbnails,
+            author: mapped.author,
+            authorId: mapped.authorId,
+            lengthSeconds: mapped.lengthSeconds,
+            viewCountText: mapped.viewCountText,
+            viewCount: mapped.viewCount,
+          });
+        }
+        if (recommendedVideos.length >= 20) break;
+      }
+    }
   }
 
-  // Extract lengthSeconds if present in basic_info or search fallback
-  let lengthSeconds = Number(info?.basic_info?.duration || 0);
+  // Extract lengthSeconds if present in basic_info, external proxy, or search fallback
+  let lengthSeconds = Number(info?.basic_info?.duration || raceData?.lengthSeconds || 0);
   if (!lengthSeconds && title) {
-    const searchLookup = await yt.search(videoId).catch(() => null);
+    const yt = await ytPromiseLocal;
+    const searchLookup = yt ? await yt.search(videoId).catch(() => null) : null;
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const matched = searchLookup?.videos?.find((v: any) => v?.id === videoId);
     if (matched) {
@@ -1079,14 +1712,14 @@ async function fetchVideoFull(videoId: string): Promise<VideoResponse> {
         ? raceData.formatStreams
         : [];
 
-  // Cache stream URLs for /latest_version, /api/v1/stream/mux, and /api/v1/download proxying
+  // Cache stream URLs for /latest_version, /api/v1/stream/mux, /api/v1/stream/googlevideo, and /api/v1/download proxying
   for (const fmt of [...adaptiveFormats, ...formatStreams]) {
     if (fmt.url && fmt.itag) {
       cacheSet(`stream:${videoId}:${fmt.itag}`, { url: fmt.url, type: fmt.type }, 1_800_000, 'stream-url');
     }
   }
 
-  const hlsManifestUrl = directData?.hlsManifestUrl || undefined;
+  const hlsManifestUrl = directData?.hlsManifestUrl || raceData?.hlsManifestUrl || undefined;
   const hasDirectStreams = adaptiveFormats.length > 0 || formatStreams.length > 0 || Boolean(hlsManifestUrl);
   const hlsProxyUrl = hlsManifestUrl
     ? `/api/v1/stream/hls-proxy?url=${encodeURIComponent(hlsManifestUrl)}`
@@ -1108,25 +1741,29 @@ async function fetchVideoFull(videoId: string): Promise<VideoResponse> {
               ? '2160p60 4K'
               : '1080p HD';
 
-  const relayBase = streamConfig.customUpstreamUrl || 'https://yt.chocolatemoo53.com';
+  const topInvRelay = getRankedExternalCandidates(
+    'invidious',
+    [streamConfig.customUpstreamUrl || 'https://yt.chocolatemoo53.com'],
+  )[0] || 'https://yt.chocolatemoo53.com';
+  const relayHost = topInvRelay.replace(/^https?:\/\//, '');
   const clientRelayStreams = [
     {
-      label: '720p HD (MP4 リレー)',
+      label: '720p HD (サーバー保護MP4リレー)',
       itag: '22',
-      host: relayBase.replace(/^https?:\/\//, ''),
-      url: `${relayBase}/latest_version?id=${encodeURIComponent(videoId)}&itag=22&local=true`,
+      host: relayHost,
+      url: `/api/v1/stream/relay/${encodeURIComponent(videoId)}?host=${encodeURIComponent(relayHost)}&itag=22`,
     },
     {
-      label: '360p (MP4 リレー)',
+      label: '360p (サーバー保護MP4リレー)',
       itag: '18',
-      host: relayBase.replace(/^https?:\/\//, ''),
-      url: `${relayBase}/latest_version?id=${encodeURIComponent(videoId)}&itag=18&local=true`,
+      host: relayHost,
+      url: `/api/v1/stream/relay/${encodeURIComponent(videoId)}?host=${encodeURIComponent(relayHost)}&itag=18`,
     },
   ];
 
   const streamErrorReason = hasDirectStreams
     ? undefined
-    : 'クラウドサーバーIPがYouTubeのBot確認対象となったため、生ストリームURLを直接取得できませんでした。下の「YouTube デバイス認証 (4K解除)」でTVコード認証を行うか、「接続設定」から外部HTTP/SOCKS5プロキシ（IP変更）または YouTube Cookie を設定すると 4K/1080p 生ストリームが解除されます。';
+    : '外部プロキシ・クラスタで生ストリーム解決中、または一部制限動画です。下の「外部Invidious/Zernio自動復旧」や「正規 Edu再生 (youtubeeducation.com)」をお試しください。';
 
   const eduEmbed = buildEduEmbedConfig(
     videoId,
@@ -1160,8 +1797,8 @@ async function fetchVideoFull(videoId: string): Promise<VideoResponse> {
     authorUrl: authorId ? `/channel/${authorId}` : '',
     authorVerified: Boolean(info?.secondary_info?.owner?.author?.is_verified),
     authorThumbnails: authorThumb
-      ? [{ url: authorThumb, width: 88, height: 88 }]
-      : [],
+      ? [{ url: proxyMediaUrl(authorThumb), width: 88, height: 88 }]
+      : raceData?.authorThumbnails || [],
     subCountText,
     lengthSeconds,
     liveNow: false,
@@ -1186,8 +1823,175 @@ async function fetchVideoFull(videoId: string): Promise<VideoResponse> {
 // Public Reverse Proxy Security Shield (0.0.0.0:3000)
 // ---------------------------------------------------------------------------
 const ORIGIN_PORT = 3001;
+const ORIGIN_PORTS = [3001, 3002, 3003, 3004, 3005, 3006, 3007, 3008, 3009, 3010] as const;
 const ORIGIN_HOST = '127.0.0.1';
 const ORIGIN_AUTH_TOKEN = crypto.randomBytes(32).toString('hex');
+
+interface OriginInstanceDef {
+  id: string;
+  name: string;
+  port: number;
+  tier: ServerTier;
+  tierLabel: string;
+  endpoint: string;
+  protocol: string;
+  capabilities: string[];
+  priority: number;
+}
+
+const ORIGIN_INSTANCES: OriginInstanceDef[] = [
+  {
+    id: 'kuro-inst-01',
+    name: '安定インスタンス1 · H.264 MP4 プロキシノード (:3001)',
+    port: 3001,
+    tier: 'stable',
+    tierLabel: '安定型',
+    endpoint: '/api/kuro/stable-stream/:id',
+    protocol: 'HTTP/1.1 Keep-Alive · MP4',
+    capabilities: ['H.264固定', '学校端末互換', 'AAC音声'],
+    priority: 1,
+  },
+  {
+    id: 'kuro-inst-02',
+    name: '安定インスタンス2 · プロキシ動画情報＆検索クラスタ (:3002)',
+    port: 3002,
+    tier: 'stable',
+    tierLabel: '安定型',
+    endpoint: '/api/v1/videos/:id',
+    protocol: 'HTTP/1.1 Keep-Alive · JSON',
+    capabilities: ['プロキシ経由メタ取得', '検索・予測補完', '関連動画保証'],
+    priority: 2,
+  },
+  {
+    id: 'kuro-inst-03',
+    name: '安定インスタンス3 · Edu (Classroom/Kahoot) ゲートウェイ (:3003)',
+    port: 3003,
+    tier: 'stable',
+    tierLabel: '安定型 (Edu)',
+    endpoint: '/api/kuro/edu-embed/:id',
+    protocol: 'IFrame JS API · Edu',
+    capabilities: ['youtubeeducation.com', 'Google Classroom', 'Kahoot!'],
+    priority: 3,
+  },
+  {
+    id: 'kuro-inst-04',
+    name: '高速インスタンス4 · Googlevideo IP秘匿 Range エッジ (:3004)',
+    port: 3004,
+    tier: 'fast',
+    tierLabel: '高速型',
+    endpoint: '/api/v1/stream/googlevideo/:id',
+    protocol: 'HTTP 206 Range · Keep-Alive',
+    capabilities: ['IPヘッダー遮蔽', 'UA擬装', '0ms先読み'],
+    priority: 1,
+  },
+  {
+    id: 'kuro-inst-05',
+    name: '高速インスタンス5 · マルチノード並列レーサー＆先読み (:3005)',
+    port: 3005,
+    tier: 'fast',
+    tierLabel: '高速型',
+    endpoint: '/api/kuro/fast-stream/:id',
+    protocol: 'Promise.any Race · Prefetch',
+    capabilities: ['L1メモリ直結', '先読みプリフェッチ', '低遅延'],
+    priority: 2,
+  },
+  {
+    id: 'kuro-inst-06',
+    name: '高速インスタンス6 · メディア・サムネイル中継プロキシ (:3006)',
+    port: 3006,
+    tier: 'fast',
+    tierLabel: '高速型',
+    endpoint: '/api/v1/media-proxy',
+    protocol: 'SSRF-Safe Proxy · Cached',
+    capabilities: ['画像/アイコン中継', 'IP非露出', 'キャッシュ配信'],
+    priority: 3,
+  },
+  {
+    id: 'kuro-inst-07',
+    name: '高画質インスタンス7 · 4K60 HDR + FFmpeg MP4結合 (:3007)',
+    port: 3007,
+    tier: 'hq',
+    tierLabel: '高画質型',
+    endpoint: '/api/kuro/hq-stream/:id',
+    protocol: 'WebPo + FFmpeg Mux',
+    capabilities: ['2160p60 4K', 'HDR10/AV1', 'MP4リアルタイム結合'],
+    priority: 1,
+  },
+  {
+    id: 'kuro-inst-08',
+    name: '高画質インスタンス8 · Adaptive HLS (.m3u8) 生成ノード (:3008)',
+    port: 3008,
+    tier: 'hq',
+    tierLabel: '高画質型',
+    endpoint: '/api/v1/stream/hls-gen/:id/index.m3u8',
+    protocol: 'HLS / MPEG-TS',
+    capabilities: ['適応ビットレート', '無停止10秒スキップ', '4K対応'],
+    priority: 2,
+  },
+  {
+    id: 'kuro-inst-09',
+    name: '高画質インスタンス9 · BotGuard WebPo & 高音質リレー (:3009)',
+    port: 3009,
+    tier: 'hq',
+    tierLabel: '高画質型',
+    endpoint: '/api/v1/stream/relay/:id',
+    protocol: 'WebPo + Safe Relay',
+    capabilities: ['POトークン生成', '安全リレー検証', '1080p60+'],
+    priority: 3,
+  },
+  {
+    id: 'kuro-inst-10',
+    name: '統合復旧インスタンス10 · Invidious/Zernio 自動探索ノード (:3010)',
+    port: 3010,
+    tier: 'stable',
+    tierLabel: '復旧・探索型',
+    endpoint: '/api/kuro/live-servers',
+    protocol: '2-Stage Stream Verify',
+    capabilities: ['生存ノード自動ランキング', 'ストリーム実抽出検証', '自動復旧'],
+    priority: 4,
+  },
+];
+
+const instanceRequestCounts = new Map<number, number>(ORIGIN_PORTS.map((p) => [p, 0]));
+let rrCursor = 0;
+
+function pickOriginPortForPath(reqUrl: string): number[] {
+  const pathLower = reqUrl.toLowerCase();
+  let preferredPool: readonly number[];
+  if (pathLower.includes('/edu-embed') || pathLower.includes('/stable-stream')) {
+    preferredPool = [3001, 3002, 3003];
+  } else if (
+    pathLower.includes('/googlevideo') ||
+    pathLower.includes('/fast-stream') ||
+    pathLower.includes('/thumbnail') ||
+    pathLower.includes('/media-proxy') ||
+    pathLower.includes('/prefetch')
+  ) {
+    preferredPool = [3004, 3005, 3006];
+  } else if (
+    pathLower.includes('/hq-stream') ||
+    pathLower.includes('/stream/mux') ||
+    pathLower.includes('/stream/hls') ||
+    pathLower.includes('/4k-stream') ||
+    pathLower.includes('/stream/relay')
+  ) {
+    preferredPool = [3007, 3008, 3009];
+  } else if (
+    pathLower.includes('/external-recover') ||
+    pathLower.includes('/live-servers') ||
+    pathLower.includes('/nodes/') ||
+    pathLower.includes('/translate')
+  ) {
+    preferredPool = [3010, 3002, 3005];
+  } else {
+    preferredPool = ORIGIN_PORTS;
+  }
+
+  const idx = rrCursor++ % preferredPool.length;
+  const primary = preferredPool[idx];
+  const fallback = ORIGIN_PORTS.filter((p) => p !== primary);
+  return [primary, ...fallback];
+}
 
 const shieldRules: ShieldRules = {
   rateLimitPerMinute: 240,
@@ -1272,26 +2076,11 @@ function checkRateLimit(clientIp: string): { allowed: boolean; retryAfterSec: nu
 }
 
 async function startServer(): Promise<void> {
-  // 1. Self-Hosted Protected Invidious Origin Server (Loopback-Only 127.0.0.1:3001)
-  const originApp = express();
-  originApp.use(compression({ threshold: 512 }));
-  originApp.use(express.json({ limit: '256kb' }));
+  // 1. Shared Origin Router mounted across 10 isolated Loopback HTTP Instances (127.0.0.1:3001 - 3010)
+  const originRouter = express.Router();
 
-  // Origin Isolation Guard: Rejects ANY direct access not signed by the Reverse Proxy Shield
-  originApp.use((req, res, next) => {
-    const token = req.headers['x-kuro-origin-token'];
-    if (token !== ORIGIN_AUTH_TOKEN) {
-      res.status(403).json({
-        error: 'オリジンサーバーへの直接アクセスは遮断されました (403 Forbidden)。リバースプロキシ (:3000) 経由でアクセスしてください。',
-        originIsolated: true,
-      });
-      return;
-    }
-    next();
-  });
-
-  // Timing middleware on Origin API routes
-  originApp.use(['/api/v1', '/api/kuro'], (req, res, next) => {
+  // Timing & Edge Metrics middleware on Origin API routes
+  originRouter.use(['/api/v1', '/api/kuro'], (_req, res, next) => {
     const start = performance.now();
     const originalJson = res.json.bind(res);
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -1307,8 +2096,8 @@ async function startServer(): Promise<void> {
     next();
   });
 
-  // Alias origin routes onto `app` variable so all route handlers mount on the isolated Origin Server
-  const app = originApp;
+  // Alias origin routes onto `app` variable so all route handlers mount across all 10 Origin Instances
+  const app = originRouter;
 
   // 1. GET /api/v1/stats
   app.get('/api/v1/stats', (_req, res) => {
@@ -1463,22 +2252,31 @@ async function startServer(): Promise<void> {
 
     metrics.misses += 1;
     try {
-      const yt = await getYt();
-      const searchRes = await yt.search(q, {
-        type: type === 'channel' || type === 'playlist' ? type : 'video',
-        prioritize: sortBy === 'view_count' || sortBy === 'rating' ? 'popularity' : 'relevance',
-        upload_date: sortBy === 'upload_date' ? 'month' : 'all',
-      });
-
-      const items: SearchVideoItem[] = [];
-      for (const v of searchRes.videos || []) {
-        const mapped = mapRawVideoItem(v);
-        if (mapped) items.push(mapped);
+      let items: SearchVideoItem[] = [];
+      let usedSource = 'innertube-search';
+      try {
+        const yt = await getYt();
+        const searchRes = await yt.search(q, {
+          type: type === 'channel' || type === 'playlist' ? type : 'video',
+          prioritize: sortBy === 'view_count' || sortBy === 'rating' ? 'popularity' : 'relevance',
+          upload_date: sortBy === 'upload_date' ? 'month' : 'all',
+        });
+        for (const v of searchRes.videos || []) {
+          const mapped = mapRawVideoItem(v);
+          if (mapped) items.push(mapped);
+        }
+      } catch {
+        // Fallback directly to external proxy pool
       }
 
-      cacheSet(cacheKey, items, 180_000, 'innertube-search');
+      if (items.length === 0) {
+        items = await searchViaExternalProxy(q, type, sortBy);
+        usedSource = 'external-proxy-search';
+      }
+
+      cacheSet(cacheKey, items, 180_000, usedSource);
       res.setHeader('X-Cache', 'MISS');
-      res.setHeader('X-Upstream-Node', 'innertube-search');
+      res.setHeader('X-Upstream-Node', usedSource);
       res.json(items);
     } catch (err) {
       res.status(502).json({ error: err instanceof Error ? err.message : 'Search failed' });
@@ -1515,22 +2313,32 @@ async function startServer(): Promise<void> {
     const searchQuery = queryMap[type] || queryMap['4K'];
 
     try {
-      const yt = await getYt();
-      const searchRes = await yt.search(searchQuery, {
-        type: 'video',
-        prioritize: 'relevance',
-        features: type === '4K' ? ['4k'] : undefined,
-      });
-      const items: SearchVideoItem[] = [];
-      for (const v of searchRes.videos || []) {
-        const mapped = mapRawVideoItem(v);
-        if (mapped) items.push(mapped);
-        if (items.length >= 24) break;
+      let items: SearchVideoItem[] = [];
+      let usedSource = 'innertube-feed';
+      try {
+        const yt = await getYt();
+        const searchRes = await yt.search(searchQuery, {
+          type: 'video',
+          prioritize: 'relevance',
+          features: type === '4K' ? ['4k'] : undefined,
+        });
+        for (const v of searchRes.videos || []) {
+          const mapped = mapRawVideoItem(v);
+          if (mapped) items.push(mapped);
+          if (items.length >= 24) break;
+        }
+      } catch {
+        // fallback below
       }
 
-      cacheSet(cacheKey, items, 300_000, 'innertube-feed');
+      if (items.length === 0) {
+        items = await searchViaExternalProxy(searchQuery, 'video', 'relevance');
+        usedSource = 'external-proxy-feed';
+      }
+
+      cacheSet(cacheKey, items, 300_000, usedSource);
       res.setHeader('X-Cache', 'MISS');
-      res.setHeader('X-Upstream-Node', 'innertube-feed');
+      res.setHeader('X-Upstream-Node', usedSource);
       res.json(items);
     } catch (err) {
       res.status(502).json({ error: err instanceof Error ? err.message : 'Trending feed failed' });
@@ -1591,44 +2399,56 @@ async function startServer(): Promise<void> {
 
     metrics.misses += 1;
     try {
-      const yt = await getYt();
-      const thread = await yt.getComments(videoId);
       const comments: CommentItem[] = [];
-
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      for (const c of (thread.contents || []) as any[]) {
-        const cm = c?.comment;
-        if (!cm) continue;
-        const content = cm.content?.text || '';
-        if (!content) continue;
-        const author = cm.author?.name || 'Anonymous';
-        const authorId = cm.author?.id || '';
-        const avatar = cm.author?.thumbnails?.[0]?.url || '';
-        comments.push({
-          author,
-          authorThumbnails: avatar ? [{ url: avatar, width: 48, height: 48 }] : [],
-          authorId,
-          authorUrl: authorId ? `/channel/${authorId}` : '',
-          isEdited: false,
-          content,
-          contentHtml: textToHtml(content),
-          published: Math.floor(Date.now() / 1000),
-          publishedText: cm.published?.text || '',
-          likeCount: parseViewCount(cm.vote_count?.text || cm.like_count),
-          commentId: cm.comment_id || `${videoId}_${comments.length}`,
-          authorIsChannelOwner: Boolean(cm.author?.is_verified),
-          replies: cm.reply_count ? { replyCount: Number(cm.reply_count) || 0 } : undefined,
-        });
+      let usedSource = 'innertube-comments';
+      try {
+        const yt = await getYt();
+        const thread = await yt.getComments(videoId);
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        for (const c of (thread.contents || []) as any[]) {
+          const cm = c?.comment;
+          if (!cm) continue;
+          const content = cm.content?.text || '';
+          if (!content) continue;
+          const author = cm.author?.name || 'Anonymous';
+          const authorId = cm.author?.id || '';
+          const avatar = cm.author?.thumbnails?.[0]?.url || '';
+          comments.push({
+            author,
+            authorThumbnails: avatar ? [{ url: proxyMediaUrl(avatar), width: 48, height: 48 }] : [],
+            authorId,
+            authorUrl: authorId ? `/channel/${authorId}` : '',
+            isEdited: false,
+            content,
+            contentHtml: textToHtml(content),
+            published: Math.floor(Date.now() / 1000),
+            publishedText: cm.published?.text || '',
+            likeCount: parseViewCount(cm.vote_count?.text || cm.like_count),
+            commentId: cm.comment_id || `${videoId}_${comments.length}`,
+            authorIsChannelOwner: Boolean(cm.author?.is_verified),
+            replies: cm.reply_count ? { replyCount: Number(cm.reply_count) || 0 } : undefined,
+          });
+        }
+      } catch {
+        // fallback below
       }
 
-      const payload: CommentsResponse = {
+      let payload: CommentsResponse = {
         commentCount: comments.length,
         videoId,
         comments,
       };
-      cacheSet(cacheKey, payload, 300_000, 'innertube-comments');
+      if (comments.length === 0) {
+        const ext = await fetchCommentsViaExternalProxy(videoId);
+        if (ext) {
+          payload = ext;
+          usedSource = 'external-proxy-comments';
+        }
+      }
+
+      cacheSet(cacheKey, payload, 300_000, usedSource);
       res.setHeader('X-Cache', 'MISS');
-      res.setHeader('X-Upstream-Node', 'innertube-comments');
+      res.setHeader('X-Upstream-Node', usedSource);
       res.json(payload);
     } catch (err) {
       res.status(502).json({ error: err instanceof Error ? err.message : 'Comments fetch failed' });
@@ -1655,50 +2475,77 @@ async function startServer(): Promise<void> {
 
     metrics.misses += 1;
     try {
-      const yt = await getYt();
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      const ch: any = await yt.getChannel(channelId);
-      const latestVideos: SearchVideoItem[] = [];
-      for (const v of ch?.videos || []) {
-        const mapped = mapRawVideoItem(v);
-        if (mapped) latestVideos.push(mapped);
-        if (latestVideos.length >= 24) break;
+      let payload: ChannelResponse | null = null;
+      let usedSource = 'innertube-channel';
+      try {
+        const yt = await getYt();
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const ch: any = await yt.getChannel(channelId);
+        const latestVideos: SearchVideoItem[] = [];
+        for (const v of ch?.videos || []) {
+          const mapped = mapRawVideoItem(v);
+          if (mapped) latestVideos.push(mapped);
+          if (latestVideos.length >= 24) break;
+        }
+        const avatar = ch?.metadata?.avatar?.[0]?.url || ch?.header?.author?.thumbnails?.[0]?.url || '';
+        const banner = ch?.header?.banner?.[0]?.url || '';
+        const subText = ch?.header?.subscribers?.text || '';
+        payload = {
+          author: ch?.metadata?.title || 'Channel',
+          authorId: channelId,
+          authorUrl: `/channel/${channelId}`,
+          authorBanners: banner ? [{ url: proxyMediaUrl(banner), width: 1280, height: 240 }] : [],
+          authorThumbnails: avatar ? [{ url: proxyMediaUrl(avatar), width: 176, height: 176 }] : [],
+          subCount: parseViewCount(subText),
+          subCountText: subText,
+          totalViews: 0,
+          joined: 0,
+          autoGenerated: false,
+          isFamilyFriendly: Boolean(ch?.metadata?.is_family_safe ?? true),
+          description: ch?.metadata?.description || '',
+          descriptionHtml: textToHtml(ch?.metadata?.description || ''),
+          latestVideos,
+        };
+      } catch {
+        // fallback below
       }
 
-      const avatar = ch?.metadata?.avatar?.[0]?.url || ch?.header?.author?.thumbnails?.[0]?.url || '';
-      const banner = ch?.header?.banner?.[0]?.url || '';
-      const subText = ch?.header?.subscribers?.text || '';
+      if (!payload || payload.latestVideos.length === 0) {
+        const extCh = await fetchChannelViaExternalProxy(channelId);
+        if (extCh) {
+          payload = extCh;
+          usedSource = 'external-proxy-channel';
+        }
+      }
 
-      const payload: ChannelResponse = {
-        author: ch?.metadata?.title || 'Channel',
-        authorId: channelId,
-        authorUrl: `/channel/${channelId}`,
-        authorBanners: banner ? [{ url: banner, width: 1280, height: 240 }] : [],
-        authorThumbnails: avatar ? [{ url: avatar, width: 176, height: 176 }] : [],
-        subCount: parseViewCount(subText),
-        subCountText: subText,
-        totalViews: 0,
-        joined: 0,
-        autoGenerated: false,
-        isFamilyFriendly: Boolean(ch?.metadata?.is_family_safe ?? true),
-        description: ch?.metadata?.description || '',
-        descriptionHtml: textToHtml(ch?.metadata?.description || ''),
-        latestVideos,
-      };
+      if (!payload) {
+        res.status(502).json({ error: 'Channel lookup failed across all proxy nodes' });
+        return;
+      }
 
-      cacheSet(cacheKey, payload, 300_000, 'innertube-channel');
+      cacheSet(cacheKey, payload, 300_000, usedSource);
       res.setHeader('X-Cache', 'MISS');
-      res.setHeader('X-Upstream-Node', 'innertube-channel');
+      res.setHeader('X-Upstream-Node', usedSource);
       res.json(payload);
     } catch (err) {
       res.status(502).json({ error: err instanceof Error ? err.message : 'Channel lookup failed' });
     }
   });
 
-  // 10. GET /api/v1/thumbnail/:id/:quality (Zero-broken-image fast proxy with automatic fallback)
+  // 10. GET /api/v1/thumbnail/:id/:quality (Cached Proxy with Invidious/ytimg multi-relay fallback)
   app.get('/api/v1/thumbnail/:id/:quality', async (req, res) => {
     const videoId = String(req.params.id || '').replace(/[^a-zA-Z0-9_-]/g, '');
     const requested = String(req.params.quality || 'maxresdefault').replace(/[^a-zA-Z0-9_-]/g, '');
+    const thumbCacheKey = `thumb:${videoId}:${requested}`;
+    const cachedThumb = cacheGet<Buffer>(thumbCacheKey);
+    if (cachedThumb.hit && cachedThumb.data) {
+      res.setHeader('Content-Type', 'image/jpeg');
+      res.setHeader('X-Cache', 'HIT');
+      res.setHeader('Cache-Control', 'public, max-age=86400, immutable');
+      res.send(cachedThumb.data);
+      return;
+    }
+
     const order =
       requested === 'maxresdefault'
         ? ['maxresdefault', 'sddefault', 'hqdefault']
@@ -1708,21 +2555,145 @@ async function startServer(): Promise<void> {
 
     for (const q of order) {
       try {
-        const upstream = await fetch(`https://i.ytimg.com/vi/${videoId}/${q}.jpg`, {
-          signal: AbortSignal.timeout(3000),
+        const upstream = await proxiedFetch(`https://i.ytimg.com/vi/${videoId}/${q}.jpg`, {
+          headers: { 'User-Agent': PRIVACY_USER_AGENTS[0] },
+          signal: AbortSignal.timeout(2600),
         });
         if (upstream.ok) {
           const buf = Buffer.from(await upstream.arrayBuffer());
+          cacheSet(thumbCacheKey, buf, 1_800_000, 'ytimg-proxy');
           res.setHeader('Content-Type', 'image/jpeg');
           res.setHeader('Cache-Control', 'public, max-age=86400, immutable');
           res.send(buf);
           return;
         }
       } catch {
-        // try next fallback quality
+        // try next fallback quality or Invidious mirror
+      }
+    }
+
+    const invMirrors = getRankedExternalCandidates(
+      'invidious',
+      FALLBACK_INVIDIOUS_HOSTS.slice(0, 3).map((h) => `https://${h}`),
+    ).slice(0, 2);
+    for (const host of invMirrors) {
+      try {
+        const upstream = await proxiedFetch(`${host}/vi/${videoId}/hqdefault.jpg`, {
+          headers: { 'User-Agent': PRIVACY_USER_AGENTS[0] },
+          signal: AbortSignal.timeout(2500),
+        });
+        if (upstream.ok) {
+          const buf = Buffer.from(await upstream.arrayBuffer());
+          cacheSet(thumbCacheKey, buf, 1_800_000, 'invidious-thumb-proxy');
+          res.setHeader('Content-Type', 'image/jpeg');
+          res.setHeader('Cache-Control', 'public, max-age=86400, immutable');
+          res.send(buf);
+          return;
+        }
+      } catch {
+        // continue
       }
     }
     res.status(404).end();
+  });
+
+  // 10b. GET /api/v1/media-proxy (SSRF-safe YouTube/Invidious Avatar & Banner Image Proxy)
+  app.get('/api/v1/media-proxy', async (req, res) => {
+    const rawUrl = String(req.query.url || '').trim();
+    if (!rawUrl) {
+      res.status(400).end();
+      return;
+    }
+    let parsed: URL;
+    try {
+      parsed = new URL(rawUrl);
+    } catch {
+      res.status(400).end();
+      return;
+    }
+    const allowedHosts = ['i.ytimg.com', 'i9.ytimg.com', 's.ytimg.com', 'yt3.ggpht.com', 'yt3.googleusercontent.com'];
+    const hostOk =
+      parsed.protocol === 'https:' &&
+      !isPrivateOrLocalHostname(parsed.hostname) &&
+      allowedHosts.some((d) => parsed.hostname === d || parsed.hostname.endsWith(`.${d}`));
+    if (!hostOk) {
+      res.status(403).json({ error: '許可されていないメディアホストです' });
+      return;
+    }
+
+    const cacheKey = `mimg:${crypto.createHash('sha1').update(rawUrl).digest('hex').slice(0, 16)}`;
+    const cached = cacheGet<{ buf: Buffer; ct: string }>(cacheKey);
+    if (cached.hit && cached.data) {
+      res.setHeader('Content-Type', cached.data.ct);
+      res.setHeader('Cache-Control', 'public, max-age=86400');
+      res.setHeader('X-Cache', 'HIT');
+      res.send(cached.data.buf);
+      return;
+    }
+
+    try {
+      const upstream = await proxiedFetch(rawUrl, {
+        headers: { 'User-Agent': PRIVACY_USER_AGENTS[0] },
+        signal: AbortSignal.timeout(4000),
+      });
+      if (!upstream.ok) {
+        res.status(upstream.status).end();
+        return;
+      }
+      const ct = upstream.headers.get('content-type') || 'image/jpeg';
+      const buf = Buffer.from(await upstream.arrayBuffer());
+      cacheSet(cacheKey, { buf, ct }, 1_800_000, 'media-proxy');
+      res.setHeader('Content-Type', ct);
+      res.setHeader('Cache-Control', 'public, max-age=86400');
+      res.send(buf);
+    } catch {
+      res.status(502).end();
+    }
+  });
+
+  // 10c. GET /api/v1/stream/relay/:id (Server-Side Protected External Relay Stream Proxy)
+  app.get('/api/v1/stream/relay/:id', async (req, res) => {
+    const id = String(req.params.id || '').trim();
+    const host = String(req.query.host || '').trim().replace(/^https?:\/\//i, '').replace(/\/.*$/, '');
+    const itag = String(req.query.itag || '18').trim();
+    if (!/^[a-zA-Z0-9_-]{6,20}$/.test(id) || !host || isPrivateOrLocalHostname(host)) {
+      res.status(400).json({ error: '不正なリレーリクエストです' });
+      return;
+    }
+    const targetUrl = `https://${host}/latest_version?id=${encodeURIComponent(id)}&itag=${encodeURIComponent(itag)}&local=true`;
+    try {
+      const upstream = await proxiedFetch(targetUrl, {
+        headers: buildMaskedUpstreamHeaders(req.headers.range, targetUrl),
+        signal: AbortSignal.timeout(18000),
+      });
+      res.status(upstream.status);
+      const ct = upstream.headers.get('content-type') || 'video/mp4';
+      const cl = upstream.headers.get('content-length');
+      const cr = upstream.headers.get('content-range');
+      res.setHeader('Content-Type', ct);
+      res.setHeader('Accept-Ranges', upstream.headers.get('accept-ranges') || 'bytes');
+      res.setHeader('X-Upstream-Node', `relay-proxy:${host}`);
+      if (cl) res.setHeader('Content-Length', cl);
+      if (cr) res.setHeader('Content-Range', cr);
+      if (!upstream.body) {
+        res.end();
+        return;
+      }
+      const reader = upstream.body.getReader();
+      res.on('close', () => {
+        if (!res.writableEnded) reader.cancel().catch(() => {});
+      });
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        if (!res.writableEnded) res.write(Buffer.from(value));
+      }
+      res.end();
+    } catch {
+      if (!res.headersSent) {
+        res.status(502).json({ error: 'リレープロキシ取得エラー' });
+      }
+    }
   });
 
   // 11. GET /latest_version (Ultra-stable self-healing Range stream proxy)
@@ -2410,18 +3381,28 @@ async function startServer(): Promise<void> {
     const region = String(body?.region || 'JP').toUpperCase();
 
     if (history.length === 0) {
-      // Cold-start fallback: blend JP trending + 4K quality feed
+      // Cold-start fallback: blend JP trending + 4K quality feed via proxy-first pipeline
       try {
-        const yt = await getYt();
-        const sr = await yt.search(region === 'JP' ? '日本 人気 急上昇 4K' : 'popular trending 4K HDR', {
-          type: 'video',
-          prioritize: 'relevance',
-        });
-        const items: SearchVideoItem[] = [];
-        for (const v of sr.videos || []) {
-          const mapped = mapRawVideoItem(v);
-          if (mapped && !excludeSet.has(mapped.videoId)) items.push(mapped);
-          if (items.length >= 24) break;
+        const query = region === 'JP' ? '日本 人気 急上昇 4K' : 'popular trending 4K HDR';
+        let items: SearchVideoItem[] = [];
+        try {
+          const yt = await getYt();
+          const sr = await yt.search(query, {
+            type: 'video',
+            prioritize: 'relevance',
+          });
+          for (const v of sr.videos || []) {
+            const mapped = mapRawVideoItem(v);
+            if (mapped && !excludeSet.has(mapped.videoId)) items.push(mapped);
+            if (items.length >= 24) break;
+          }
+        } catch {
+          // fallback below
+        }
+        if (items.length === 0) {
+          items = (await searchViaExternalProxy(query, 'video', 'relevance')).filter(
+            (m) => !excludeSet.has(m.videoId),
+          );
         }
         const payload: PersonalizedFeedResponse = {
           items,
@@ -2883,102 +3864,12 @@ async function startServer(): Promise<void> {
   });
 
   // -------------------------------------------------------------------------
-  // 16. 7サーバークラスタ (安定型3 / 高速型2 / 高画質型2) & 6種追加 Kuro API
+  // 16. 10サーバークラスタ (安定型3 / 高速型3 / 高画質型3 / 復旧探索型1 : 3001-3010実稼働)
   // -------------------------------------------------------------------------
-  const CLUSTER_SERVER_DEFS: {
-    id: string;
-    name: string;
-    tier: ServerTier;
-    tierLabel: string;
-    endpoint: string;
-    probeUrl: string;
-    protocol: string;
-    capabilities: string[];
-    priority: number;
-  }[] = [
-    {
-      id: 'srv-stable-invi',
-      name: '安定サーバー1 · Invidious H.264 互換クラスタ',
-      tier: 'stable',
-      tierLabel: '安定型',
-      endpoint: '/api/kuro/stable-stream/:id',
-      probeUrl: 'https://inv.nadeko.net/api/v1/stats',
-      protocol: 'HTTPS / MP4',
-      capabilities: ['H.264固定', '学校端末互換', 'AAC音声'],
-      priority: 1,
-    },
-    {
-      id: 'srv-stable-piped',
-      name: '安定サーバー2 · Piped マルチリレー',
-      tier: 'stable',
-      tierLabel: '安定型',
-      endpoint: '/api/kuro/stable-stream/:id?node=piped',
-      probeUrl: 'https://pipedapi.kavin.rocks/trending?region=JP',
-      protocol: 'HTTPS / JSON',
-      capabilities: ['CORS迂回', '低負荷再生', '自動復旧'],
-      priority: 2,
-    },
-    {
-      id: 'srv-stable-edu',
-      name: '安定サーバー3 · Education 埋め込みゲートウェイ',
-      tier: 'stable',
-      tierLabel: '安定型 (Edu)',
-      endpoint: '/api/kuro/edu-embed/:id',
-      probeUrl: 'https://www.youtube.com/oembed?url=https://www.youtube.com/watch?v=aqz-KE-bpKQ&format=json',
-      protocol: 'Classroom / Kahoot',
-      capabilities: ['Google Classroom', 'Kahoot!', '学校制限回避'],
-      priority: 3,
-    },
-    {
-      id: 'srv-fast-gv',
-      name: '高速サーバー4 · Googlevideo IP偽装 Range エッジ',
-      tier: 'fast',
-      tierLabel: '高速型',
-      endpoint: '/api/v1/stream/googlevideo/:id',
-      probeUrl: `http://${ORIGIN_HOST}:${ORIGIN_PORT}/api/v1/stats`,
-      protocol: 'HTTP/2 Range 206',
-      capabilities: ['IPヘッダー遮蔽', 'UA擬装', '0ms先読み'],
-      priority: 1,
-    },
-    {
-      id: 'srv-fast-race',
-      name: '高速サーバー5 · マルチノード最速並列レーサー',
-      tier: 'fast',
-      tierLabel: '高速型',
-      endpoint: '/api/kuro/fast-stream/:id',
-      probeUrl: 'https://yt.chocolatemoo53.com/api/v1/stats',
-      protocol: 'Promise.any Race',
-      capabilities: ['L1メモリ直結', '並列レース', '低遅延'],
-      priority: 2,
-    },
-    {
-      id: 'srv-hq-innertube',
-      name: '高画質サーバー6 · 4K60 HDR + FFmpeg MP4結合エンジン',
-      tier: 'hq',
-      tierLabel: '高画質型',
-      endpoint: '/api/kuro/hq-stream/:id',
-      probeUrl: `http://${ORIGIN_HOST}:${ORIGIN_PORT}/api/v1/config/stream`,
-      protocol: 'WebPo + FFmpeg Mux',
-      capabilities: ['2160p60 4K', 'HDR10/AV1', 'MP4リアルタイム結合'],
-      priority: 1,
-    },
-    {
-      id: 'srv-hq-hls',
-      name: '高画質サーバー7 · Adaptive HLS (.m3u8) 配信ノード',
-      tier: 'hq',
-      tierLabel: '高画質型',
-      endpoint: '/api/v1/stream/hls-gen/:id/index.m3u8',
-      probeUrl: 'https://invidious.nerdvpn.de/api/v1/stats',
-      protocol: 'HLS / MPEG-TS',
-      capabilities: ['適応ビットレート', '無停止シーク', '4K対応'],
-      priority: 2,
-    },
-  ];
-
-  // 独自 API 4: GET /api/kuro/cluster-nodes (7サーバーの死活・応答速度リアルタイム監視)
+  // 独自 API 4: GET /api/kuro/cluster-nodes (10サーバーの実ソケット死活・応答速度・処理件数監視)
   app.get('/api/kuro/cluster-nodes', async (req, res) => {
     const refresh = req.query.refresh === 'true';
-    const cacheKey = 'kuro:cluster-nodes';
+    const cacheKey = 'kuro:cluster-nodes:v2';
     if (!refresh) {
       const cached = cacheGet<ClusterServerNode[]>(cacheKey);
       if (cached.hit && !cached.stale && cached.data) {
@@ -2990,48 +3881,53 @@ async function startServer(): Promise<void> {
     }
 
     const probed: ClusterServerNode[] = await Promise.all(
-      CLUSTER_SERVER_DEFS.map(async (srv): Promise<ClusterServerNode> => {
+      ORIGIN_INSTANCES.map(async (inst): Promise<ClusterServerNode> => {
         const t0 = performance.now();
         try {
-          const isInternal = srv.probeUrl.includes(`${ORIGIN_HOST}:${ORIGIN_PORT}`);
-          const headers: Record<string, string> = isInternal
-            ? { 'x-kuro-origin-token': ORIGIN_AUTH_TOKEN }
-            : { 'User-Agent': PRIVACY_USER_AGENTS[0] };
-          const r = await proxiedFetch(srv.probeUrl, {
-            headers,
-            signal: AbortSignal.timeout(2500),
+          const r = await proxiedFetch(`http://${ORIGIN_HOST}:${inst.port}/health`, {
+            headers: { 'x-kuro-origin-token': ORIGIN_AUTH_TOKEN },
+            signal: AbortSignal.timeout(2000),
           });
           const latencyMs = Math.max(1, Math.round(performance.now() - t0));
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          const hJson = r.ok ? ((await r.json().catch(() => null)) as any) : null;
           return {
-            id: srv.id,
-            name: srv.name,
-            tier: srv.tier,
-            tierLabel: srv.tierLabel,
-            endpoint: srv.endpoint,
-            protocol: srv.protocol,
+            id: inst.id,
+            name: inst.name,
+            tier: inst.tier,
+            tierLabel: inst.tierLabel,
+            endpoint: inst.endpoint,
+            protocol: inst.protocol,
+            port: inst.port,
+            handledRequests:
+              typeof hJson?.handledRequests === 'number'
+                ? hJson.handledRequests
+                : instanceRequestCounts.get(inst.port) || 0,
             status: r.ok ? (latencyMs < 1100 ? 'online' : 'degraded') : 'degraded',
             latencyMs,
-            capabilities: srv.capabilities,
-            priority: srv.priority,
+            capabilities: inst.capabilities,
+            priority: inst.priority,
           };
         } catch {
           return {
-            id: srv.id,
-            name: srv.name,
-            tier: srv.tier,
-            tierLabel: srv.tierLabel,
-            endpoint: srv.endpoint,
-            protocol: srv.protocol,
+            id: inst.id,
+            name: inst.name,
+            tier: inst.tier,
+            tierLabel: inst.tierLabel,
+            endpoint: inst.endpoint,
+            protocol: inst.protocol,
+            port: inst.port,
+            handledRequests: instanceRequestCounts.get(inst.port) || 0,
             status: 'offline',
             latencyMs: null,
-            capabilities: srv.capabilities,
-            priority: srv.priority,
+            capabilities: inst.capabilities,
+            priority: inst.priority,
           };
         }
       }),
     );
 
-    cacheSet(cacheKey, probed, 45_000, 'kuro-cluster-supervisor');
+    cacheSet(cacheKey, probed, 15_000, 'kuro-cluster-supervisor');
     res.setHeader('X-Cache', 'MISS');
     res.setHeader('X-Upstream-Node', 'kuro-cluster-supervisor');
     res.json(probed);
@@ -3045,7 +3941,16 @@ async function startServer(): Promise<void> {
       return;
     }
 
-    const cacheKey = `kuro:edu:${videoId}`;
+    const pubOriginHdr = String(req.headers['x-kuro-public-origin'] || '').trim();
+    const reqOrigin =
+      typeof req.headers.origin === 'string' && req.headers.origin.startsWith('http')
+        ? req.headers.origin
+        : pubOriginHdr.startsWith('http')
+          ? pubOriginHdr
+          : undefined;
+    const lang = String(req.query.lang || 'ja').slice(0, 10) || 'ja';
+
+    const cacheKey = `kuro:edu:${videoId}:${lang}:${reqOrigin || 'default'}`;
     const cached = cacheGet<EduEmbedConfig>(cacheKey);
     if (cached.hit && !cached.stale && cached.data) {
       res.setHeader('X-Cache', 'HIT');
@@ -3064,9 +3969,12 @@ async function startServer(): Promise<void> {
       author = vidCached.data.author;
     } else {
       try {
-        const oe = await fetch(
+        const oe = await proxiedFetch(
           `https://www.youtube.com/oembed?url=https://www.youtube.com/watch?v=${encodeURIComponent(videoId)}&format=json`,
-          { signal: AbortSignal.timeout(3000) },
+          {
+            headers: { 'User-Agent': PRIVACY_USER_AGENTS[0] },
+            signal: AbortSignal.timeout(3000),
+          },
         );
         if (oe.ok) {
           // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -3074,13 +3982,15 @@ async function startServer(): Promise<void> {
           if (d?.title) title = String(d.title);
           if (d?.author_name) author = String(d.author_name);
           embeddable = true;
+        } else if (oe.status === 401 || oe.status === 403 || oe.status === 404) {
+          embeddable = false;
         }
       } catch {
         // continue with fallback metadata
       }
     }
 
-    const payload = buildEduEmbedConfig(videoId, title, author, embeddable);
+    const payload = buildEduEmbedConfig(videoId, title, author, embeddable, lang, reqOrigin);
     cacheSet(cacheKey, payload, 600_000, 'kuro-edu-gateway');
     res.setHeader('X-Cache', 'MISS');
     res.setHeader('X-Upstream-Node', 'kuro-edu-gateway');
@@ -3115,10 +4025,10 @@ async function startServer(): Promise<void> {
       const eduEmbed = video.eduEmbed || buildEduEmbedConfig(videoId, video.title, video.author);
 
       res.setHeader('X-Cache', 'DYNAMIC');
-      res.setHeader('X-Upstream-Node', 'kuro-stable-invi');
+      res.setHeader('X-Upstream-Node', 'kuro-inst-01');
       res.json({
         tier: 'stable',
-        serverId: 'srv-stable-invi',
+        serverId: 'kuro-inst-01',
         videoId,
         title: video.title,
         author: video.author,
@@ -3148,10 +4058,10 @@ async function startServer(): Promise<void> {
       const targetItag = bestProg?.itag || bestAdaptive?.itag || '22';
 
       res.setHeader('X-Cache', 'DYNAMIC');
-      res.setHeader('X-Upstream-Node', 'kuro-fast-gv');
+      res.setHeader('X-Upstream-Node', 'kuro-inst-04');
       res.json({
         tier: 'fast',
-        serverId: 'srv-fast-gv',
+        serverId: 'kuro-inst-04',
         videoId,
         title: video.title,
         author: video.author,
@@ -3188,10 +4098,10 @@ async function startServer(): Promise<void> {
       const bestA = aTracks[0] || null;
 
       res.setHeader('X-Cache', 'DYNAMIC');
-      res.setHeader('X-Upstream-Node', 'kuro-hq-innertube');
+      res.setHeader('X-Upstream-Node', 'kuro-inst-07');
       res.json({
         tier: 'hq',
-        serverId: 'srv-hq-innertube',
+        serverId: 'kuro-inst-07',
         videoId,
         title: video.title,
         maxQuality: bestV?.qualityLabel || video.maxResolution || '1080p',
@@ -3209,7 +4119,7 @@ async function startServer(): Promise<void> {
     }
   });
 
-  // 独自 API 9: GET /api/kuro/auto-fallback/:id (環境判定付き7サーバー自動フォールバック統合 API)
+  // 独自 API 9: GET /api/kuro/auto-fallback/:id (環境判定付き10インスタンス自動フォールバック統合 API)
   app.get('/api/kuro/auto-fallback/:id', async (req, res) => {
     const videoId = String(req.params.id || '').trim();
     const profile = String(req.query.profile || 'auto');
@@ -3246,59 +4156,59 @@ async function startServer(): Promise<void> {
     const eduEmbed = video?.eduEmbed || buildEduEmbedConfig(videoId, video?.title || '', video?.author || '');
 
     let selectedTier: ServerTier = 'fast';
-    let selectedServer = 'srv-stable-edu';
+    let selectedServer = 'kuro-inst-03';
     let selectedEngine: AutoFallbackStreamResponse['selectedEngine'] = 'edu-classroom';
     let streamUrl: string | null = eduEmbed.classroomUrl;
 
     const tryHq = () => {
       const ms = Math.round((performance.now() - tStart) * 100) / 100;
       if (muxUrl) {
-        attempts.push({ serverId: 'srv-hq-innertube', serverName: '高画質サーバー6 (4K MP4結合)', tier: 'hq', ok: true, latencyMs: ms, detail: `${capV?.qualityLabel || 'HD'} MP4 Mux 解決` });
+        attempts.push({ serverId: 'kuro-inst-07', serverName: '高画質インスタンス7 (4K MP4結合 :3007)', tier: 'hq', ok: true, latencyMs: ms, detail: `${capV?.qualityLabel || 'HD'} MP4 Mux 解決` });
         selectedTier = 'hq';
-        selectedServer = 'srv-hq-innertube';
+        selectedServer = 'kuro-inst-07';
         selectedEngine = 'mux';
         streamUrl = muxUrl;
         return true;
       }
       if (hlsUrl) {
-        attempts.push({ serverId: 'srv-hq-hls', serverName: '高画質サーバー7 (Adaptive HLS)', tier: 'hq', ok: true, latencyMs: ms, detail: 'HLS .m3u8 解決' });
+        attempts.push({ serverId: 'kuro-inst-08', serverName: '高画質インスタンス8 (Adaptive HLS :3008)', tier: 'hq', ok: true, latencyMs: ms, detail: 'HLS .m3u8 解決' });
         selectedTier = 'hq';
-        selectedServer = 'srv-hq-hls';
+        selectedServer = 'kuro-inst-08';
         selectedEngine = 'hls';
         streamUrl = hlsUrl;
         return true;
       }
-      attempts.push({ serverId: 'srv-hq-innertube', serverName: '高画質サーバー6 (4K MP4結合)', tier: 'hq', ok: false, latencyMs: ms, detail: '高画質ストリーム未解決・次サーバーへフォールバック' });
+      attempts.push({ serverId: 'kuro-inst-07', serverName: '高画質インスタンス7 (4K MP4結合 :3007)', tier: 'hq', ok: false, latencyMs: ms, detail: '高画質ストリーム未解決・次インスタンスへフォールバック' });
       return false;
     };
 
     const tryFast = () => {
       const ms = Math.round((performance.now() - tStart) * 100) / 100;
       if (gvUrl) {
-        attempts.push({ serverId: 'srv-fast-gv', serverName: '高速サーバー4 (Googlevideo IP偽装MP4)', tier: 'fast', ok: true, latencyMs: ms, detail: `itag=${bestProg?.itag} Range中継準備完了` });
+        attempts.push({ serverId: 'kuro-inst-04', serverName: '高速インスタンス4 (Googlevideo IP偽装MP4 :3004)', tier: 'fast', ok: true, latencyMs: ms, detail: `itag=${bestProg?.itag} Range中継準備完了` });
         selectedTier = 'fast';
-        selectedServer = 'srv-fast-gv';
+        selectedServer = 'kuro-inst-04';
         selectedEngine = 'googlevideo';
         streamUrl = gvUrl;
         return true;
       }
-      attempts.push({ serverId: 'srv-fast-gv', serverName: '高速サーバー4 (Googlevideo IP偽装MP4)', tier: 'fast', ok: false, latencyMs: ms, detail: '直接MP4未解決・安定型へフォールバック' });
+      attempts.push({ serverId: 'kuro-inst-04', serverName: '高速インスタンス4 (Googlevideo IP偽装MP4 :3004)', tier: 'fast', ok: false, latencyMs: ms, detail: '直接MP4未解決・安定型へフォールバック' });
       return false;
     };
 
     const tryStable = () => {
       const ms = Math.round((performance.now() - tStart) * 100) / 100;
       if (bestProg?.proxyUrl) {
-        attempts.push({ serverId: 'srv-stable-invi', serverName: '安定サーバー1 (H.264 互換MP4)', tier: 'stable', ok: true, latencyMs: ms, detail: '学校端末互換 H.264/AAC 解決' });
+        attempts.push({ serverId: 'kuro-inst-01', serverName: '安定インスタンス1 (H.264 互換MP4 :3001)', tier: 'stable', ok: true, latencyMs: ms, detail: '学校端末互換 H.264/AAC 解決' });
         selectedTier = 'stable';
-        selectedServer = 'srv-stable-invi';
+        selectedServer = 'kuro-inst-01';
         selectedEngine = 'progressive';
         streamUrl = bestProg.proxyUrl;
         return true;
       }
-      attempts.push({ serverId: 'srv-stable-edu', serverName: '安定サーバー3 (Classroom/Kahoot Edu再生)', tier: 'stable', ok: true, latencyMs: ms, detail: 'Classroom / Kahoot 教育用埋め込みへ自動フォールバック' });
+      attempts.push({ serverId: 'kuro-inst-03', serverName: '安定インスタンス3 (Classroom/Kahoot Edu再生 :3003)', tier: 'stable', ok: true, latencyMs: ms, detail: 'Classroom / Kahoot 教育用埋め込みへ自動フォールバック' });
       selectedTier = 'stable';
-      selectedServer = 'srv-stable-edu';
+      selectedServer = 'kuro-inst-03';
       selectedEngine = 'edu-classroom';
       streamUrl = eduEmbed.classroomUrl;
       return true;
@@ -3313,7 +4223,6 @@ async function startServer(): Promise<void> {
     } else if (profile === 'fast') {
       if (!tryFast() && !tryHq()) tryStable();
     } else {
-      // Auto profile: HQ if fast connection & 1080p+, otherwise Fast Googlevideo, then Stable/Edu
       const preferHq = downlink >= 12 && maxH >= 1080;
       if (preferHq) {
         if (!tryHq() && !tryFast()) tryStable();
@@ -3345,27 +4254,13 @@ async function startServer(): Promise<void> {
   });
 
   // -------------------------------------------------------------------------
-  // 17. Live Server Health Monitor (7-Cluster + External Invidious + Zernio/Piped)
-  //     & Universal External Recovery & Auto-Translation / Subtitles
+  // 17. High-Performance 2-Stage Live Server Discovery & Auto-Recovery Engine
+  //     (10-Instance Cluster + External Invidious + Zernio + Piped)
   // -------------------------------------------------------------------------
-  const EXTERNAL_PIPED_NODES = [
-    { name: 'Piped Kavin', url: 'https://pipedapi.kavin.rocks', region: 'EU-Global' },
-    { name: 'Piped Leptons', url: 'https://pipedapi.leptons.xyz', region: 'EU-DE' },
-    { name: 'Piped AdminForge', url: 'https://pipedapi.adminforge.de', region: 'EU-DE' },
-    { name: 'Piped PrivateCoffee', url: 'https://api.piped.private.coffee', region: 'EU-AT' },
-    { name: 'Piped MooMoo', url: 'https://pipedapi.moomoo.me', region: 'US' },
-    { name: 'Piped Darkness', url: 'https://pipedapi.darkness.services', region: 'EU' },
-  ];
-
-  const ZERNIO_BASE_NODES = [
-    { id: 'zernio-api', name: 'Zernio API (api.zernio.com)', url: 'https://api.zernio.com', region: 'Global' },
-    { id: 'zernio-web', name: 'Zernio Gateway (zernio.com)', url: 'https://zernio.com', region: 'Global' },
-  ];
-
   async function probeHttpLiveness(
     url: string,
     headers: Record<string, string> = {},
-    timeoutMs = 2800,
+    timeoutMs = 2400,
   ): Promise<{ ok: boolean; statusCode: number | null; latencyMs: number | null; version?: string }> {
     const t0 = performance.now();
     try {
@@ -3395,69 +4290,84 @@ async function startServer(): Promise<void> {
     }
   }
 
+  // Stage-2 verification: verify node can actually extract playable stream manifests (cached 120s)
+  async function verifyNodeStreamExtraction(
+    baseUrl: string,
+    kind: 'invidious' | 'piped' | 'zernio',
+  ): Promise<boolean> {
+    const clean = baseUrl.replace(/\/+$/, '');
+    const cacheKey = `node:stream-verify:${clean}`;
+    const cached = cacheGet<boolean>(cacheKey);
+    if (cached.hit && !cached.stale && typeof cached.data === 'boolean') {
+      return cached.data;
+    }
+
+    const testVid = 'aqz-KE-bpKQ';
+    try {
+      if (kind === 'invidious') {
+        const r = await proxiedFetch(`${clean}/api/v1/videos/${testVid}`, {
+          headers: { 'User-Agent': PRIVACY_USER_AGENTS[0] },
+          signal: AbortSignal.timeout(2400),
+        });
+        if (!r.ok) {
+          cacheSet(cacheKey, false, 120_000, 'stage2');
+          return false;
+        }
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const d = (await r.json()) as any;
+        const ok = Boolean((d?.formatStreams?.length || 0) > 0 || (d?.adaptiveFormats?.length || 0) > 0 || d?.hlsUrl);
+        cacheSet(cacheKey, ok, 120_000, 'stage2');
+        return ok;
+      }
+
+      // Piped or Zernio
+      let r = await proxiedFetch(`${clean}/streams/${testVid}`, {
+        headers: { 'User-Agent': PRIVACY_USER_AGENTS[0] },
+        signal: AbortSignal.timeout(2400),
+      });
+      if (!r.ok && kind === 'zernio') {
+        r = await proxiedFetch(`${clean}/api/v1/videos/${testVid}`, {
+          headers: { 'User-Agent': PRIVACY_USER_AGENTS[0] },
+          signal: AbortSignal.timeout(2400),
+        });
+      }
+      if (!r.ok) {
+        cacheSet(cacheKey, false, 120_000, 'stage2');
+        return false;
+      }
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const d = (await r.json()) as any;
+      const ok = Boolean(
+        (d?.videoStreams?.length || 0) > 0 ||
+          (d?.audioStreams?.length || 0) > 0 ||
+          (d?.formatStreams?.length || 0) > 0 ||
+          (d?.adaptiveFormats?.length || 0) > 0 ||
+          d?.hls ||
+          d?.hlsUrl,
+      );
+      cacheSet(cacheKey, ok, 120_000, 'stage2');
+      return ok;
+    } catch {
+      cacheSet(cacheKey, false, 90_000, 'stage2');
+      return false;
+    }
+  }
+
   async function buildLiveServersSnapshot(
     customInvidiousUrl?: string,
     customZernioUrl?: string,
   ): Promise<LiveServersResponse> {
     const checkedAt = new Date().toISOString();
-
-    // Fetch live Invidious instances dynamically from api.invidious.io
-    let dynamicInv: { domain: string; uri: string; region: string; cors: boolean }[] = [];
-    try {
-      const r = await fetch('https://api.invidious.io/instances.json?sort_by=health', {
-        signal: AbortSignal.timeout(3000),
-      });
-      if (r.ok) {
-        // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        const list = (await r.json()) as [string, any][];
-        dynamicInv = list
-          .filter(([, meta]) => meta?.type === 'https' && meta?.api)
-          .slice(0, 8)
-          .map(([domain, meta]) => ({
-            domain,
-            uri: String(meta.uri || `https://${domain}`).replace(/\/+$/, ''),
-            region: String(meta.region || 'Global'),
-            cors: Boolean(meta.cors),
-          }));
-      }
-    } catch {
-      // keep curated defaults
-    }
-
-    const invMap = new Map<string, { domain: string; uri: string; region: string; cors: boolean }>();
-    if (customInvidiousUrl && /^https?:\/\//i.test(customInvidiousUrl)) {
-      const clean = customInvidiousUrl.replace(/\/+$/, '');
-      invMap.set(clean, { domain: `${clean.replace(/^https?:\/\//, '')} (カスタム)`, uri: clean, region: 'Custom', cors: true });
-    }
-    if (streamConfig.customUpstreamUrl && /^https?:\/\//i.test(streamConfig.customUpstreamUrl)) {
-      const clean = streamConfig.customUpstreamUrl.replace(/\/+$/, '');
-      invMap.set(clean, { domain: `${clean.replace(/^https?:\/\//, '')} (接続設定)`, uri: clean, region: 'Custom', cors: true });
-    }
-    for (const d of dynamicInv) invMap.set(d.uri, d);
-    for (const host of FALLBACK_INVIDIOUS_HOSTS) {
-      const uri = `https://${host}`;
-      if (!invMap.has(uri)) invMap.set(uri, { domain: host, uri, region: 'Global', cors: true });
-    }
-
-    const zernioCandidates = [...ZERNIO_BASE_NODES];
-    if (customZernioUrl && /^https?:\/\//i.test(customZernioUrl)) {
-      const clean = customZernioUrl.replace(/\/+$/, '');
-      zernioCandidates.unshift({
-        id: 'zernio-custom',
-        name: `カスタム Zernio サーバー (${clean.replace(/^https?:\/\//, '')})`,
-        url: clean,
-        region: 'Custom',
-      });
-    }
+    const pools = await discoverDynamicExternalPools(customInvidiousUrl, customZernioUrl);
 
     const [clusterProbes, invProbes, zernioProbes, pipedProbes] = await Promise.all([
+      // Probe all 10 live isolated origin HTTP instances (127.0.0.1:3001 - 3010)
       Promise.all(
-        CLUSTER_SERVER_DEFS.map(async (srv): Promise<LiveServerCheckItem> => {
-          const isInternal = srv.probeUrl.includes(`${ORIGIN_HOST}:${ORIGIN_PORT}`);
+        ORIGIN_INSTANCES.map(async (inst): Promise<LiveServerCheckItem> => {
           const probe = await probeHttpLiveness(
-            srv.probeUrl,
-            isInternal ? { 'x-kuro-origin-token': ORIGIN_AUTH_TOKEN } : {},
-            2400,
+            `http://${ORIGIN_HOST}:${inst.port}/health`,
+            { 'x-kuro-origin-token': ORIGIN_AUTH_TOKEN },
+            1800,
           );
           const alive: LiveServerCheckItem['alive'] =
             probe.statusCode === null
@@ -3468,25 +4378,33 @@ async function startServer(): Promise<void> {
                   : 'degraded'
                 : 'degraded';
           return {
-            id: srv.id,
-            name: srv.name,
+            id: inst.id,
+            name: inst.name,
             category: 'self-cluster',
-            categoryLabel: `自前クラスタ (${srv.tierLabel})`,
-            url: srv.endpoint,
+            categoryLabel: `自前10インスタンス (${inst.tierLabel})`,
+            url: `${inst.endpoint} (:${inst.port})`,
             region: 'JP-Edge',
             statusCode: probe.statusCode,
             alive,
             latencyMs: probe.latencyMs,
             cors: true,
             supportsStreams: true,
+            streamVerified: alive !== 'dead',
+            reliabilityScore: alive === 'alive' ? 100 : alive === 'degraded' ? 75 : 0,
             checkedAt,
-            note: srv.capabilities.join(' · '),
+            note: `${inst.capabilities.join(' · ')} · 処理 ${instanceRequestCounts.get(inst.port) || 0}件`,
           };
         }),
       ),
+
+      // Top 20 Invidious candidates with Stage-2 stream extraction verification
       Promise.all(
-        [...invMap.values()].slice(0, 10).map(async (node, idx): Promise<LiveServerCheckItem> => {
-          const probe = await probeHttpLiveness(`${node.uri}/api/v1/stats`, {}, 2600);
+        pools.invidious.slice(0, 20).map(async (node, idx): Promise<LiveServerCheckItem> => {
+          const probe = await probeHttpLiveness(`${node.uri}/api/v1/stats`, {}, 2300);
+          let streamVerified = false;
+          if (probe.ok) {
+            streamVerified = await verifyNodeStreamExtraction(node.uri, 'invidious');
+          }
           const alive: LiveServerCheckItem['alive'] =
             probe.statusCode === null
               ? 'dead'
@@ -3495,6 +4413,16 @@ async function startServer(): Promise<void> {
                   ? 'alive'
                   : 'degraded'
                 : 'dead';
+          recordExternalNodeOutcome(
+            node.uri,
+            'invidious',
+            alive !== 'dead',
+            streamVerified,
+            probe.latencyMs ?? 4000,
+            probe.statusCode,
+            { region: node.region, version: probe.version, cors: node.cors },
+          );
+          const rec = externalNodeRegistry.get(node.uri);
           return {
             id: `inv-${idx}-${node.domain}`,
             name: `Invidious · ${node.domain}`,
@@ -3508,26 +4436,59 @@ async function startServer(): Promise<void> {
             latencyMs: probe.latencyMs,
             cors: node.cors,
             supportsStreams: alive !== 'dead',
+            streamVerified,
+            reliabilityScore: rec?.score ?? (alive === 'alive' ? 70 : 0),
             checkedAt,
-            note: alive === 'alive' ? 'API 疎通正常' : alive === 'degraded' ? '高遅延または制限応答' : '応答なし / 停止中',
+            note: streamVerified
+              ? 'API疎通 + ストリーム実抽出検証OK'
+              : alive === 'alive'
+                ? 'API疎通正常 (軽量検証)'
+                : alive === 'degraded'
+                  ? '高遅延または制限応答'
+                  : '応答なし / 停止中',
           };
         }),
       ),
+
+      // Zernio endpoints (multi-path probe)
       Promise.all(
-        zernioCandidates.map(async (z): Promise<LiveServerCheckItem> => {
-          const targetProbe = z.id === 'zernio-api' ? `${z.url}/v1/health` : z.url;
-          let probe = await probeHttpLiveness(targetProbe, {}, 2600);
-          if (!probe.ok && z.id === 'zernio-custom') {
-            probe = await probeHttpLiveness(`${z.url}/api/v1/stats`, {}, 2400);
+        pools.zernio.map(async (z): Promise<LiveServerCheckItem> => {
+          const probeTargets = z.id === 'zernio-custom'
+            ? [`${z.url}/v1/health`, `${z.url}/api/v1/stats`, `${z.url}/trending?region=JP`, z.url]
+            : z.id === 'zernio-api'
+              ? [`${z.url}/v1/health`, z.url]
+              : [z.url];
+
+          let bestProbe = await probeHttpLiveness(probeTargets[0], {}, 2300);
+          for (let i = 1; i < probeTargets.length && !bestProbe.ok && bestProbe.statusCode !== 401 && bestProbe.statusCode !== 403; i++) {
+            bestProbe = await probeHttpLiveness(probeTargets[i], {}, 2200);
           }
+
+          let streamVerified = false;
+          if (z.id === 'zernio-custom' && (bestProbe.ok || bestProbe.statusCode === 401)) {
+            streamVerified = await verifyNodeStreamExtraction(z.url, 'zernio');
+          }
+
+          const isUp = bestProbe.ok || bestProbe.statusCode === 401 || bestProbe.statusCode === 403;
           const alive: LiveServerCheckItem['alive'] =
-            probe.statusCode === null
+            bestProbe.statusCode === null
               ? 'dead'
-              : probe.ok || probe.statusCode === 401 || probe.statusCode === 403
-                ? (probe.latencyMs ?? 0) < 1500
+              : isUp
+                ? (bestProbe.latencyMs ?? 0) < 1500
                   ? 'alive'
                   : 'degraded'
                 : 'dead';
+
+          recordExternalNodeOutcome(
+            z.url,
+            'zernio',
+            isUp,
+            streamVerified,
+            bestProbe.latencyMs ?? 4000,
+            bestProbe.statusCode,
+            { region: z.region, cors: true },
+          );
+          const rec = externalNodeRegistry.get(z.url);
           return {
             id: z.id,
             name: z.name,
@@ -3535,24 +4496,33 @@ async function startServer(): Promise<void> {
             categoryLabel: 'Zernio サーバー',
             url: z.url,
             region: z.region,
-            statusCode: probe.statusCode,
+            statusCode: bestProbe.statusCode,
             alive,
-            latencyMs: probe.latencyMs,
+            latencyMs: bestProbe.latencyMs,
             cors: true,
-            supportsStreams: z.id === 'zernio-custom' && alive !== 'dead',
+            supportsStreams: z.id === 'zernio-custom' && isUp,
+            streamVerified,
+            reliabilityScore: rec?.score ?? (isUp ? 60 : 0),
             checkedAt,
-            note:
-              probe.statusCode === 401 || probe.statusCode === 403
-                ? 'サーバー生存 (API認証エンドポイント稼働中)'
+            note: streamVerified
+              ? 'Zernio ストリーム抽出検証OK'
+              : bestProbe.statusCode === 401 || bestProbe.statusCode === 403
+                ? 'サーバー生存 (API認証ゲート稼働中)'
                 : alive === 'alive'
                   ? 'オンライン稼働中'
                   : '接続不可 / 停止中',
           };
         }),
       ),
+
+      // Top 12 Piped candidates with Stage-2 stream extraction verification
       Promise.all(
-        EXTERNAL_PIPED_NODES.map(async (p, idx): Promise<LiveServerCheckItem> => {
-          const probe = await probeHttpLiveness(`${p.url}/trending?region=JP`, {}, 2600);
+        pools.piped.slice(0, 12).map(async (p, idx): Promise<LiveServerCheckItem> => {
+          const probe = await probeHttpLiveness(`${p.url}/trending?region=JP`, {}, 2300);
+          let streamVerified = false;
+          if (probe.ok) {
+            streamVerified = await verifyNodeStreamExtraction(p.url, 'piped');
+          }
           const alive: LiveServerCheckItem['alive'] =
             probe.statusCode === null
               ? 'dead'
@@ -3561,6 +4531,16 @@ async function startServer(): Promise<void> {
                   ? 'alive'
                   : 'degraded'
                 : 'dead';
+          recordExternalNodeOutcome(
+            p.url,
+            'piped',
+            alive !== 'dead',
+            streamVerified,
+            probe.latencyMs ?? 4000,
+            probe.statusCode,
+            { region: p.region, cors: true },
+          );
+          const rec = externalNodeRegistry.get(p.url);
           return {
             id: `piped-${idx}`,
             name: p.name,
@@ -3573,12 +4553,30 @@ async function startServer(): Promise<void> {
             latencyMs: probe.latencyMs,
             cors: true,
             supportsStreams: alive !== 'dead',
+            streamVerified,
+            reliabilityScore: rec?.score ?? (alive === 'alive' ? 70 : 0),
             checkedAt,
-            note: alive === 'alive' ? 'ストリーム解決可' : '応答エラー / 停止',
+            note: streamVerified
+              ? 'Piped ストリーム実抽出検証OK'
+              : alive === 'alive'
+                ? 'ストリーム解決可'
+                : '応答エラー / 停止',
           };
         }),
       ),
     ]);
+
+    // Sort external categories so verified & fastest live nodes appear first
+    const sortByHealth = (a: LiveServerCheckItem, b: LiveServerCheckItem) => {
+      const sa = (a.streamVerified ? 1000 : 0) + (a.alive === 'alive' ? 300 : a.alive === 'degraded' ? 100 : 0) + (a.reliabilityScore ?? 0);
+      const sb = (b.streamVerified ? 1000 : 0) + (b.alive === 'alive' ? 300 : b.alive === 'degraded' ? 100 : 0) + (b.reliabilityScore ?? 0);
+      if (sb !== sa) return sb - sa;
+      return (a.latencyMs ?? 9999) - (b.latencyMs ?? 9999);
+    };
+
+    invProbes.sort(sortByHealth);
+    zernioProbes.sort(sortByHealth);
+    pipedProbes.sort(sortByHealth);
 
     const servers = [...clusterProbes, ...invProbes, ...zernioProbes, ...pipedProbes];
     return {
@@ -3597,7 +4595,7 @@ async function startServer(): Promise<void> {
     };
   }
 
-  // 独自 API 10: GET /api/kuro/live-servers (全サーバー 生存/遅延/停止 死活監視)
+  // 独自 API 10: GET /api/kuro/live-servers (全サーバー 生存/遅延/停止 & ストリーム抽出検証)
   app.get('/api/kuro/live-servers', async (req, res) => {
     const refresh = req.query.refresh === 'true';
     const customInv = String(req.query.customInvidious || '').trim();
@@ -3621,7 +4619,71 @@ async function startServer(): Promise<void> {
     res.json(snapshot);
   });
 
-  // 独自 API 11: POST /api/kuro/external-recover/:id (外部 Invidious + Zernio 生存サーバー自動検索＆再生復旧)
+  // ブラウザ検証成功ノードをサーバー側の生存ランキングへ即時反映
+  app.post('/api/kuro/nodes/report-live', (req, res) => {
+    const body = (req.body || {}) as {
+      url?: string;
+      category?: 'invidious' | 'zernio' | 'piped';
+      ok?: boolean;
+      streamVerified?: boolean;
+      latencyMs?: number;
+    };
+    const url = String(body.url || '').trim();
+    if (!/^https?:\/\//i.test(url)) {
+      res.status(400).json({ error: 'Invalid node URL' });
+      return;
+    }
+    const category =
+      body.category === 'zernio' || body.category === 'piped' ? body.category : 'invidious';
+    recordExternalNodeOutcome(
+      url,
+      category,
+      body.ok !== false,
+      Boolean(body.streamVerified),
+      Math.max(1, Number(body.latencyMs || 180)),
+      body.ok !== false ? 200 : 502,
+      { note: 'ブラウザ実再生検証によりスコア昇格' },
+    );
+    res.json({ ok: true, registrySize: externalNodeRegistry.size });
+  });
+
+  // 先読みプリフェッチ API: 関連上位動画のメタデータ＋サムネイルをバックグラウンド先読み
+  app.post('/api/kuro/prefetch', async (req, res) => {
+    const idsRaw: unknown[] = Array.isArray(req.body?.ids) ? req.body.ids : [];
+    const ids = Array.from(
+      new Set<string>(idsRaw.map((x) => String(x || '').trim())),
+    )
+      .filter((id) => /^[a-zA-Z0-9_-]{6,20}$/.test(id))
+      .slice(0, 4);
+
+    if (ids.length === 0) {
+      res.json({ queued: 0, ids: [] });
+      return;
+    }
+
+    // Warm video metadata + maxres thumbnail in background without blocking response
+    Promise.allSettled(
+      ids.map(async (id) => {
+        await ensureVideoCached(id, false).catch(() => null);
+        const thumbKey = `thumb:${id}:maxresdefault`;
+        if (!cacheGet<Buffer>(thumbKey).hit) {
+          const r = await proxiedFetch(`https://i.ytimg.com/vi/${encodeURIComponent(id)}/maxresdefault.jpg`, {
+            signal: AbortSignal.timeout(2500),
+          }).catch(() => null);
+          if (r && r.ok) {
+            const buf = Buffer.from(await r.arrayBuffer());
+            if (buf.length > 500) cacheSet(thumbKey, buf, 1_800_000, 'prefetch-thumb');
+          }
+        }
+      }),
+    ).catch(() => {});
+
+    res.setHeader('X-Cache', 'DYNAMIC');
+    res.setHeader('X-Upstream-Node', 'kuro-inst-05');
+    res.json({ queued: ids.length, ids });
+  });
+
+  // 独自 API 11: POST /api/kuro/external-recover/:id (外部 Invidious + Zernio/Piped 高性能ランキング自動復旧)
   app.post('/api/kuro/external-recover/:id', async (req, res) => {
     const videoId = String(req.params.id || '').trim();
     if (!/^[a-zA-Z0-9_-]{6,20}$/.test(videoId)) {
@@ -3633,22 +4695,35 @@ async function startServer(): Promise<void> {
     const customInv = String(body.customInvidiousUrl || '').trim().replace(/\/+$/, '');
     const customZernio = String(body.customZernioUrl || '').trim().replace(/\/+$/, '');
 
-    const snapshot = await buildLiveServersSnapshot(customInv, customZernio);
-    const invTargets = snapshot.servers.filter(
-      (s) => s.category === 'invidious' && s.alive !== 'dead',
-    );
-    const zernioTargets = snapshot.servers.filter(
-      (s) => (s.category === 'zernio' || s.category === 'piped') && s.alive !== 'dead',
-    );
+    const [pools, snapshot] = await Promise.all([
+      discoverDynamicExternalPools(customInv, customZernio),
+      buildLiveServersSnapshot(customInv, customZernio),
+    ]);
 
-    // Also include top fallback hosts even if health check was throttled
-    const invUrls = new Set<string>(invTargets.map((s) => s.url));
-    if (customInv) invUrls.add(customInv);
-    for (const h of FALLBACK_INVIDIOUS_HOSTS.slice(0, 5)) invUrls.add(`https://${h}`);
+    const rankedInv = getRankedExternalCandidates(
+      'invidious',
+      [
+        ...(customInv ? [customInv] : []),
+        ...snapshot.servers.filter((s) => s.category === 'invidious' && s.alive !== 'dead').map((s) => s.url),
+        ...pools.invidious.map((p) => p.uri),
+      ],
+    ).slice(0, 12);
 
-    const relayUrls = new Set<string>(zernioTargets.filter((z) => z.url.startsWith('http')).map((s) => s.url));
-    if (customZernio) relayUrls.add(customZernio);
-    for (const p of EXTERNAL_PIPED_NODES.slice(0, 4)) relayUrls.add(p.url);
+    const rankedRelay = [
+      ...(customZernio ? [customZernio] : []),
+      ...getRankedExternalCandidates(
+        'zernio',
+        pools.zernio.filter((z) => z.id === 'zernio-custom' || z.id === 'zernio-api').map((z) => z.url),
+      ),
+      ...getRankedExternalCandidates(
+        'piped',
+        [
+          ...snapshot.servers.filter((s) => s.category === 'piped' && s.alive !== 'dead').map((s) => s.url),
+          ...pools.piped.map((p) => p.url),
+        ],
+      ),
+    ];
+    const uniqueRelays = [...new Set(rankedRelay)].slice(0, 12);
 
     const attempts: ExternalRecoveryAttempt[] = [];
     const raceTasks: Promise<{
@@ -3659,7 +4734,7 @@ async function startServer(): Promise<void> {
       hlsManifestUrl?: string;
     }>[] = [];
 
-    for (const base of invUrls) {
+    for (const base of rankedInv) {
       raceTasks.push(
         (async () => {
           const t0 = performance.now();
@@ -3669,7 +4744,10 @@ async function startServer(): Promise<void> {
               signal: AbortSignal.timeout(4000),
             });
             const ms = Math.round(performance.now() - t0);
-            if (!r.ok) throw new Error(`HTTP ${r.status}`);
+            if (!r.ok) {
+              recordExternalNodeOutcome(base, 'invidious', false, false, ms, r.status);
+              throw new Error(`HTTP ${r.status}`);
+            }
             // eslint-disable-next-line @typescript-eslint/no-explicit-any
             const d = (await r.json()) as any;
             const adaptiveFormats: AdaptiveFormat[] = (d?.adaptiveFormats || [])
@@ -3707,8 +4785,10 @@ async function startServer(): Promise<void> {
               }));
             const hlsUrl = typeof d?.hlsUrl === 'string' && d.hlsUrl ? d.hlsUrl : undefined;
             if (!adaptiveFormats.length && !formatStreams.length && !hlsUrl) {
+              recordExternalNodeOutcome(base, 'invidious', true, false, ms, r.status);
               throw new Error('ストリーム空応答');
             }
+            recordExternalNodeOutcome(base, 'invidious', true, true, ms, r.status);
             attempts.push({
               serverName: base.replace(/^https?:\/\//, ''),
               url: base,
@@ -3725,12 +4805,14 @@ async function startServer(): Promise<void> {
               hlsManifestUrl: hlsUrl,
             };
           } catch (err) {
+            const ms = Math.round(performance.now() - t0);
+            recordExternalNodeOutcome(base, 'invidious', false, false, ms, null);
             attempts.push({
               serverName: base.replace(/^https?:\/\//, ''),
               url: base,
               category: 'invidious',
               ok: false,
-              latencyMs: Math.round(performance.now() - t0),
+              latencyMs: ms,
               detail: err instanceof Error ? err.message : '失敗',
             });
             throw err;
@@ -3739,7 +4821,7 @@ async function startServer(): Promise<void> {
       );
     }
 
-    for (const base of relayUrls) {
+    for (const base of uniqueRelays) {
       const isZernio = base.includes('zernio') || (Boolean(customZernio) && base === customZernio);
       const cat: 'zernio' | 'piped' = isZernio ? 'zernio' : 'piped';
       raceTasks.push(
@@ -3757,7 +4839,10 @@ async function startServer(): Promise<void> {
               });
             }
             const ms = Math.round(performance.now() - t0);
-            if (!r.ok) throw new Error(`HTTP ${r.status}`);
+            if (!r.ok) {
+              recordExternalNodeOutcome(base, cat, false, false, ms, r.status);
+              throw new Error(`HTTP ${r.status}`);
+            }
             // eslint-disable-next-line @typescript-eslint/no-explicit-any
             const d = (await r.json()) as any;
             const vList = Array.isArray(d?.videoStreams) ? d.videoStreams : [];
@@ -3814,8 +4899,10 @@ async function startServer(): Promise<void> {
                 })),
             ];
             if (!adaptiveFormats.length && !formatStreams.length && !hlsUrl) {
+              recordExternalNodeOutcome(base, cat, true, false, ms, r.status);
               throw new Error('ストリーム未含');
             }
+            recordExternalNodeOutcome(base, cat, true, true, ms, r.status);
             attempts.push({
               serverName: base.replace(/^https?:\/\//, ''),
               url: base,
@@ -3832,12 +4919,14 @@ async function startServer(): Promise<void> {
               hlsManifestUrl: hlsUrl,
             };
           } catch (err) {
+            const ms = Math.round(performance.now() - t0);
+            recordExternalNodeOutcome(base, cat, false, false, ms, null);
             attempts.push({
               serverName: base.replace(/^https?:\/\//, ''),
               url: base,
               category: cat,
               ok: false,
-              latencyMs: Math.round(performance.now() - t0),
+              latencyMs: ms,
               detail: err instanceof Error ? err.message : '失敗',
             });
             throw err;
@@ -4201,13 +5290,68 @@ async function startServer(): Promise<void> {
     }
   });
 
-  // Start isolated self-hosted Invidious Origin on loopback 127.0.0.1:3001
-  await new Promise<void>((resolve) => {
-    originApp.listen(ORIGIN_PORT, ORIGIN_HOST, () => {
-      console.log(`Self-Hosted Invidious Origin isolated on http://${ORIGIN_HOST}:${ORIGIN_PORT}`);
-      resolve();
-    });
-  });
+  // Start 10 isolated self-hosted HTTP Origin Instances on loopback 127.0.0.1:3001 - 3010
+  await Promise.all(
+    ORIGIN_INSTANCES.map(
+      (inst) =>
+        new Promise<void>((resolve) => {
+          const instApp = express();
+          instApp.use(compression({ threshold: 512 }));
+          instApp.use(express.json({ limit: '256kb' }));
+
+          // Origin Isolation Guard: Rejects ANY direct access not signed by the Reverse Proxy Shield
+          instApp.use((req, res, next) => {
+            const token = req.headers['x-kuro-origin-token'];
+            if (token !== ORIGIN_AUTH_TOKEN) {
+              res.status(403).json({
+                error: `オリジンインスタンス ${inst.id} (:${inst.port}) への直接アクセスは遮断されました (403 Forbidden)。リバースプロキシ (:3000) 経由でアクセスしてください。`,
+                originIsolated: true,
+                instanceId: inst.id,
+                port: inst.port,
+              });
+              return;
+            }
+            const nextCount = (instanceRequestCounts.get(inst.port) || 0) + 1;
+            instanceRequestCounts.set(inst.port, nextCount);
+            res.setHeader('X-Kuro-Instance-Id', inst.id);
+            res.setHeader('X-Kuro-Instance-Port', String(inst.port));
+            next();
+          });
+
+          instApp.get('/health', (_req, res) => {
+            res.json({
+              ok: true,
+              id: inst.id,
+              name: inst.name,
+              port: inst.port,
+              tier: inst.tier,
+              handledRequests: instanceRequestCounts.get(inst.port) || 0,
+              uptimeSec: Math.round((Date.now() - START_TIME) / 1000),
+            });
+          });
+
+          instApp.use(originRouter);
+
+          instApp.listen(inst.port, ORIGIN_HOST, () => {
+            resolve();
+          });
+        }),
+    ),
+  );
+  console.log(
+    `Self-Hosted Invidious 10 Origin Instances isolated on http://${ORIGIN_HOST}:3001-3010`,
+  );
+
+  // Background external node pool warm-up so Auto-Recovery is pre-ranked immediately
+  const warmUpTimer = setTimeout(() => {
+    buildLiveServersSnapshot().catch(() => {});
+  }, 3000);
+  warmUpTimer.unref?.();
+
+  const periodicRefreshTimer = setInterval(() => {
+    buildLiveServersSnapshot().catch(() => {});
+  }, 120_000);
+  periodicRefreshTimer.unref?.();
 
   // -------------------------------------------------------------------------
   // 2. Public Reverse Proxy & WAF Security Shield (0.0.0.0:3000)
@@ -4222,6 +5366,8 @@ async function startServer(): Promise<void> {
         'X-Upstream-Node',
         'X-Proxy-Shield',
         'X-Origin-Protected',
+        'X-Kuro-Routed-Port',
+        'X-Kuro-Instance-Id',
       ],
     }),
   );
@@ -4241,7 +5387,7 @@ async function startServer(): Promise<void> {
     const t0 = performance.now();
     const payload: KuroEdgeShieldResponse = {
       status: 'PROTECTED',
-      originAddress: `${ORIGIN_HOST}:${ORIGIN_PORT} (ループバック隔離)`,
+      originAddress: `${ORIGIN_HOST}:3001-3010 (10インスタンス隔離)`,
       proxyAddress: `0.0.0.0:${PORT} (リバースプロキシ防御)`,
       originIsolationActive: true,
       rules: { ...shieldRules },
@@ -4299,14 +5445,16 @@ async function startServer(): Promise<void> {
     }
   });
 
-  // Reverse Proxy Shield Middleware forwarding /api/* and /latest_version to isolated Origin (127.0.0.1:3001)
+  // Reverse Proxy Shield Middleware forwarding /api/* and /latest_version across 10 Origin Instances (3001-3010) with failover
   proxyApp.use(['/api', '/latest_version'], (req, res) => {
     const reqStart = performance.now();
     const rawIp = req.ip || req.socket.remoteAddress || '127.0.0.1';
     const maskedIp = maskIp(rawIp);
 
-    // Skip rate limit for lightweight thumbnail assets so grids stay ultra-fast
-    const isThumbnail = req.originalUrl.startsWith('/api/v1/thumbnail/');
+    // Skip rate limit for lightweight thumbnail / media assets so grids stay ultra-fast
+    const isThumbnail =
+      req.originalUrl.startsWith('/api/v1/thumbnail/') ||
+      req.originalUrl.startsWith('/api/v1/media-proxy');
 
     // 1. WAF Inspection
     if (shieldRules.wafStrictMode) {
@@ -4357,7 +5505,7 @@ async function startServer(): Promise<void> {
       }
     }
 
-    // 3. Header Sanitization + Signed Origin Forwarding
+    // 3. Header Sanitization + Signed Origin Forwarding across 10 Instances
     const forwardHeaders: Record<string, string | string[]> = {};
     for (const [k, v] of Object.entries(req.headers)) {
       if (v === undefined) continue;
@@ -4375,60 +5523,83 @@ async function startServer(): Promise<void> {
       }
       forwardHeaders[k] = v;
     }
-    // Inject cryptographic origin auth token
     forwardHeaders['x-kuro-origin-token'] = ORIGIN_AUTH_TOKEN;
+    const publicProto = String(req.headers['x-forwarded-proto'] || req.protocol || 'http').split(',')[0].trim();
+    const publicHost = String(req.headers['x-forwarded-host'] || req.headers.host || '').split(',')[0].trim();
+    if (typeof req.headers.origin === 'string' && req.headers.origin.startsWith('http')) {
+      forwardHeaders['x-kuro-public-origin'] = req.headers.origin;
+    } else if (publicHost) {
+      forwardHeaders['x-kuro-public-origin'] = `${publicProto}://${publicHost}`;
+    }
 
-    const proxyReq = http.request(
-      {
-        hostname: ORIGIN_HOST,
-        port: ORIGIN_PORT,
-        path: req.originalUrl,
-        method: req.method,
-        headers: forwardHeaders,
-      },
-      (proxyRes) => {
-        const statusCode = proxyRes.statusCode || 502;
-        const xCache = String(proxyRes.headers['x-cache'] || '');
+    const candidatePorts = pickOriginPortForPath(req.originalUrl);
+    const hasBody = req.method !== 'GET' && req.method !== 'HEAD';
 
-        if (!isThumbnail) {
-          shieldCounters.totalProxied += 1;
-          if (xCache === 'HIT') {
-            shieldCounters.cacheHits += 1;
-          } else {
-            shieldCounters.allowed += 1;
+    const forwardToPort = (attemptIdx: number, bufferedBody?: Buffer) => {
+      const targetPort = candidatePorts[attemptIdx];
+      const proxyReq = http.request(
+        {
+          hostname: ORIGIN_HOST,
+          port: targetPort,
+          path: req.originalUrl,
+          method: req.method,
+          headers: forwardHeaders,
+        },
+        (proxyRes) => {
+          const statusCode = proxyRes.statusCode || 502;
+          const xCache = String(proxyRes.headers['x-cache'] || '');
+
+          if (!isThumbnail) {
+            shieldCounters.totalProxied += 1;
+            if (xCache === 'HIT') {
+              shieldCounters.cacheHits += 1;
+            } else {
+              shieldCounters.allowed += 1;
+            }
+            const ms = Math.round((performance.now() - reqStart) * 100) / 100;
+            recordAudit({
+              method: req.method,
+              path: req.originalUrl,
+              clientIpMasked: maskedIp,
+              action: xCache === 'HIT' ? 'CACHE_HIT' : 'ALLOW',
+              statusCode,
+              latencyMs: ms,
+            });
           }
-          const ms = Math.round((performance.now() - reqStart) * 100) / 100;
-          recordAudit({
-            method: req.method,
-            path: req.originalUrl,
-            clientIpMasked: maskedIp,
-            action: xCache === 'HIT' ? 'CACHE_HIT' : 'ALLOW',
-            statusCode,
-            latencyMs: ms,
-          });
-        }
 
-        res.status(statusCode);
-        for (const [hk, hv] of Object.entries(proxyRes.headers)) {
-          if (hv !== undefined && hk.toLowerCase() !== 'transfer-encoding') {
-            res.setHeader(hk, hv);
+          res.status(statusCode);
+          for (const [hk, hv] of Object.entries(proxyRes.headers)) {
+            if (hv !== undefined && hk.toLowerCase() !== 'transfer-encoding') {
+              res.setHeader(hk, hv);
+            }
           }
-        }
-        proxyRes.pipe(res);
-      },
-    );
+          res.setHeader('X-Kuro-Routed-Port', String(targetPort));
+          proxyRes.pipe(res);
+        },
+      );
 
-    proxyReq.on('error', (err) => {
-      if (!res.headersSent) {
-        res.status(502).json({ error: `プロキシ転送エラー: ${err.message}` });
+      proxyReq.on('error', (err) => {
+        if (!res.headersSent && !hasBody && attemptIdx + 1 < Math.min(3, candidatePorts.length)) {
+          forwardToPort(attemptIdx + 1, bufferedBody);
+          return;
+        }
+        if (!res.headersSent) {
+          res.status(502).json({ error: `プロキシ転送エラー: ${err.message}` });
+        }
+      });
+
+      res.on('close', () => {
+        if (!res.writableEnded && !proxyReq.destroyed) proxyReq.destroy();
+      });
+
+      if (hasBody) {
+        req.pipe(proxyReq);
+      } else {
+        proxyReq.end();
       }
-    });
+    };
 
-    res.on('close', () => {
-      if (!res.writableEnded && !proxyReq.destroyed) proxyReq.destroy();
-    });
-
-    req.pipe(proxyReq);
+    forwardToPort(0);
   });
 
   // Vite Dev Middleware or Production Static Serving on Public Proxy (0.0.0.0:3000)
@@ -4447,7 +5618,9 @@ async function startServer(): Promise<void> {
   }
 
   proxyApp.listen(PORT, '0.0.0.0', () => {
-    console.log(`KuroStream Reverse Proxy Shield listening on http://0.0.0.0:${PORT} -> protected origin ${ORIGIN_HOST}:${ORIGIN_PORT}`);
+    console.log(
+      `KuroStream Reverse Proxy Shield listening on http://0.0.0.0:${PORT} -> protected 10-instance cluster ${ORIGIN_HOST}:3001-3010`,
+    );
   });
 }
 
