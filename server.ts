@@ -7,7 +7,6 @@ import http from 'http';
 import path from 'path';
 import { spawn } from 'child_process';
 import { fileURLToPath } from 'url';
-import { createServer as createViteServer } from 'vite';
 import { Innertube, Platform, UniversalCache, Log } from 'youtubei.js';
 import { BotGuardClient } from 'bgutils-js/botguard';
 import { buildURL, parseLooseJSON, getHeaders, USER_AGENT } from 'bgutils-js/utils';
@@ -951,15 +950,15 @@ async function discoverUpstreamNodes(): Promise<InstanceNode[]> {
   );
 
   const selfNode: InstanceNode = {
-    domain: '0.0.0.0:3000 → 127.0.0.1:3001-3010 (10インスタンス保護)',
+    domain: '0.0.0.0:3000 → 127.0.0.1:3001-3005 (5ストリームサーバー構成)',
     uri: '',
-    region: 'JP-Edge (10-Node Proxy Cluster)',
+    region: 'JP-Edge (5-Server Stream Cluster)',
     type: 'https',
     apiEnabled: true,
     cors: true,
     status: 'online',
     latencyMs: 1,
-    version: '2.7.0-kuro-10x',
+    version: '3.0.0-headless-5x',
     isSelf: true,
   };
 
@@ -1539,12 +1538,461 @@ async function extractDirectInnertubeStreams(
 }
 
 // ---------------------------------------------------------------------------
-// Core Video Extractor (Proxy-First Multi-Relay + InnerTube + oEmbed)
+// Anubis PoW Solver + Companion & Multi-Source Guaranteed Stream Extractor
+// ---------------------------------------------------------------------------
+const COMPANION_BASES = [
+  'https://invid-api.poketube.fun/companion',
+];
+const POKETUBE_BASE = 'https://poketube.fun';
+const ANUBIS_UA = PRIVACY_USER_AGENTS[0];
+
+const anubisCookieCache = new Map<string, { cookie: string; solvedAt: number }>();
+const anubisSolveInFlight = new Map<string, Promise<string>>();
+
+async function solveAnubisForOrigin(targetUrl: string): Promise<string> {
+  const origin = new URL(targetUrl).origin;
+  const cached = anubisCookieCache.get(origin);
+  if (cached && Date.now() - cached.solvedAt < 6 * 3600_000) {
+    return cached.cookie;
+  }
+  const existingPromise = anubisSolveInFlight.get(origin);
+  if (existingPromise) return existingPromise;
+
+  const job = (async () => {
+    try {
+      const r1 = await proxiedFetch(targetUrl, {
+        headers: { 'User-Agent': ANUBIS_UA },
+        signal: AbortSignal.timeout(6000),
+      });
+      const setCookies1 = (r1.headers as unknown as { getSetCookie?: () => string[] }).getSetCookie?.() || [];
+      const html = await r1.text();
+      const chalMatch = html.match(/<script id="anubis_challenge"[^>]*>([\s\S]*?)<\/script>/);
+      if (!chalMatch) {
+        const directCookie = setCookies1.map((c) => c.split(';')[0]).join('; ');
+        if (directCookie) anubisCookieCache.set(origin, { cookie: directCookie, solvedAt: Date.now() });
+        return directCookie;
+      }
+      const chal = JSON.parse(chalMatch[1]);
+      const diff = Number(chal?.rules?.difficulty ?? 4);
+      const data = String(chal?.challenge?.randomData || '');
+      const id = String(chal?.challenge?.id || '');
+      if (!data) return '';
+
+      const prefix = '0'.repeat(Math.min(6, Math.max(1, diff)));
+      const t0 = Date.now();
+      let nonce = 0;
+      let hash = '';
+      while (nonce < 2_000_000) {
+        hash = crypto.createHash('sha256').update(data + nonce).digest('hex');
+        if (hash.startsWith(prefix)) break;
+        nonce++;
+      }
+      const elapsed = Math.max(1, Date.now() - t0);
+      const initCookie = setCookies1.map((c) => c.split(';')[0]).join('; ');
+      const passUrl =
+        `${origin}/.within.website/x/cmd/anubis/api/pass-challenge` +
+        `?id=${encodeURIComponent(id)}&response=${encodeURIComponent(hash)}&nonce=${nonce}` +
+        `&redir=${encodeURIComponent(targetUrl)}&elapsedTime=${elapsed}`;
+
+      const r2 = await proxiedFetch(passUrl, {
+        headers: { 'User-Agent': ANUBIS_UA, ...(initCookie ? { Cookie: initCookie } : {}) },
+        redirect: 'manual',
+        signal: AbortSignal.timeout(5000),
+      });
+      const setCookies2 = (r2.headers as unknown as { getSetCookie?: () => string[] }).getSetCookie?.() || [];
+      const merged = [...setCookies1, ...setCookies2]
+        .map((c) => c.split(';')[0])
+        .filter(Boolean)
+        .join('; ');
+      if (merged) {
+        anubisCookieCache.set(origin, { cookie: merged, solvedAt: Date.now() });
+      }
+      return merged;
+    } catch {
+      return '';
+    } finally {
+      anubisSolveInFlight.delete(origin);
+    }
+  })();
+
+  anubisSolveInFlight.set(origin, job);
+  return job;
+}
+
+async function fetchWithAnubis(targetUrl: string, init: RequestInit = {}): Promise<Response> {
+  const origin = new URL(targetUrl).origin;
+  const cached = anubisCookieCache.get(origin);
+  const headersObj = new Headers(init.headers as HeadersInit | undefined);
+  if (!headersObj.has('User-Agent')) headersObj.set('User-Agent', ANUBIS_UA);
+  if (cached?.cookie && !headersObj.has('Cookie')) {
+    headersObj.set('Cookie', cached.cookie);
+  }
+
+  let res = await proxiedFetch(targetUrl, { ...init, headers: headersObj });
+  const ct = (res.headers.get('content-type') || '').toLowerCase();
+  if (ct.includes('text/html') && res.status === 200) {
+    const cloneTxt = await res.clone().text().catch(() => '');
+    if (cloneTxt.includes('anubis_challenge')) {
+      anubisCookieCache.delete(origin);
+      const freshCookie = await solveAnubisForOrigin(targetUrl);
+      if (freshCookie) {
+        headersObj.set('Cookie', freshCookie);
+        res = await proxiedFetch(targetUrl, { ...init, headers: headersObj });
+      }
+    }
+  }
+  return res;
+}
+
+function extractBalancedJsonArray(html: string, key: string): unknown[] {
+  const idx = html.indexOf(`"${key}":`);
+  if (idx < 0) return [];
+  const scanFrom = html.indexOf('[', idx);
+  if (scanFrom < 0) return [];
+  let depth = 0;
+  let inStr = false;
+  let esc = false;
+  let endIdx = -1;
+  for (let i = scanFrom; i < html.length; i++) {
+    const ch = html[i];
+    if (esc) {
+      esc = false;
+      continue;
+    }
+    if (ch === '\\' && inStr) {
+      esc = true;
+      continue;
+    }
+    if (ch === '"') {
+      inStr = !inStr;
+      continue;
+    }
+    if (!inStr) {
+      if (ch === '[') depth++;
+      else if (ch === ']') {
+        depth--;
+        if (depth === 0) {
+          endIdx = i + 1;
+          break;
+        }
+      }
+    }
+  }
+  if (endIdx <= scanFrom) return [];
+  try {
+    const parsed = JSON.parse(html.slice(scanFrom, endIdx));
+    return Array.isArray(parsed) ? parsed : [];
+  } catch {
+    return [];
+  }
+}
+
+interface ItagMeta {
+  itag: string;
+  mime: string;
+  container: string;
+  encoding: string;
+  qualityLabel: string;
+  fps?: number;
+  isProgressive?: boolean;
+  isAudio?: boolean;
+  bitrate: string;
+}
+
+const ITAG_CATALOG: Record<string, ItagMeta> = {
+  '18': { itag: '18', mime: 'video/mp4; codecs="avc1.42001E, mp4a.40.2"', container: 'mp4', encoding: 'h264+aac', qualityLabel: '360p', fps: 30, isProgressive: true, bitrate: '600000' },
+  '22': { itag: '22', mime: 'video/mp4; codecs="avc1.64001F, mp4a.40.2"', container: 'mp4', encoding: 'h264+aac', qualityLabel: '720p', fps: 30, isProgressive: true, bitrate: '2200000' },
+  '140': { itag: '140', mime: 'audio/mp4; codecs="mp4a.40.2"', container: 'mp4', encoding: 'mp4a.40.2', qualityLabel: 'Audio 128k', isAudio: true, bitrate: '130000' },
+  '251': { itag: '251', mime: 'audio/webm; codecs="opus"', container: 'webm', encoding: 'opus', qualityLabel: 'Audio Opus', isAudio: true, bitrate: '160000' },
+  '258': { itag: '258', mime: 'audio/mp4; codecs="mp4a.40.2"', container: 'mp4', encoding: 'mp4a.40.2', qualityLabel: 'Audio 384k', isAudio: true, bitrate: '384000' },
+  '134': { itag: '134', mime: 'video/mp4; codecs="avc1.4D401E"', container: 'mp4', encoding: 'avc1.4D401E', qualityLabel: '360p', fps: 30, bitrate: '650000' },
+  '135': { itag: '135', mime: 'video/mp4; codecs="avc1.4D401F"', container: 'mp4', encoding: 'avc1.4D401F', qualityLabel: '480p', fps: 30, bitrate: '1100000' },
+  '136': { itag: '136', mime: 'video/mp4; codecs="avc1.4D401F"', container: 'mp4', encoding: 'avc1.4D401F', qualityLabel: '720p', fps: 30, bitrate: '2500000' },
+  '298': { itag: '298', mime: 'video/mp4; codecs="avc1.4D4020"', container: 'mp4', encoding: 'avc1.4D4020', qualityLabel: '720p60', fps: 60, bitrate: '4200000' },
+  '137': { itag: '137', mime: 'video/mp4; codecs="avc1.640028"', container: 'mp4', encoding: 'avc1.640028', qualityLabel: '1080p', fps: 30, bitrate: '4500000' },
+  '299': { itag: '299', mime: 'video/mp4; codecs="avc1.64002A"', container: 'mp4', encoding: 'avc1.64002A', qualityLabel: '1080p60', fps: 60, bitrate: '6800000' },
+  '247': { itag: '247', mime: 'video/webm; codecs="vp9"', container: 'webm', encoding: 'vp9', qualityLabel: '720p', fps: 30, bitrate: '1800000' },
+  '302': { itag: '302', mime: 'video/webm; codecs="vp9"', container: 'webm', encoding: 'vp9', qualityLabel: '720p60', fps: 60, bitrate: '2800000' },
+  '248': { itag: '248', mime: 'video/webm; codecs="vp9"', container: 'webm', encoding: 'vp9', qualityLabel: '1080p', fps: 30, bitrate: '3200000' },
+  '303': { itag: '303', mime: 'video/webm; codecs="vp9"', container: 'webm', encoding: 'vp9', qualityLabel: '1080p60', fps: 60, bitrate: '4600000' },
+  '308': { itag: '308', mime: 'video/webm; codecs="vp9"', container: 'webm', encoding: 'vp9', qualityLabel: '1440p60', fps: 60, bitrate: '13000000' },
+  '315': { itag: '315', mime: 'video/webm; codecs="vp9"', container: 'webm', encoding: 'vp9', qualityLabel: '2160p60', fps: 60, bitrate: '26000000' },
+  '313': { itag: '313', mime: 'video/webm; codecs="vp9"', container: 'webm', encoding: 'vp9', qualityLabel: '2160p', fps: 30, bitrate: '18000000' },
+  '401': { itag: '401', mime: 'video/mp4; codecs="av01.0.13M.08"', container: 'mp4', encoding: 'av01.0.13M.08', qualityLabel: '2160p60', fps: 60, bitrate: '17000000' },
+};
+
+function companionStreamUrl(videoId: string, itag: string): string {
+  return `${COMPANION_BASES[0]}/latest_version?id=${encodeURIComponent(videoId)}&itag=${encodeURIComponent(itag)}&local=true`;
+}
+
+function poketubeDownloadUrl(videoId: string, itag: string): string {
+  return `${POKETUBE_BASE}/api/video/download?v=${encodeURIComponent(videoId)}&q=${encodeURIComponent(itag)}`;
+}
+
+async function probeCompanionItags(videoId: string): Promise<{
+  adaptiveFormats: AdaptiveFormat[];
+  formatStreams: FormatStream[];
+}> {
+  const probeItags = ['18', '140', '251', '136', '298', '137', '299', '302', '303', '248', '247', '308', '315'];
+  const results = await Promise.allSettled(
+    probeItags.map(async (itag) => {
+      const target = companionStreamUrl(videoId, itag);
+      const r = await proxiedFetch(target, {
+        headers: { 'User-Agent': ANUBIS_UA, Range: 'bytes=0-0' },
+        signal: AbortSignal.timeout(4500),
+      });
+      if (!r.ok) return null;
+      const ct = (r.headers.get('content-type') || '').toLowerCase();
+      if (ct.includes('text/plain') || ct.includes('text/html')) return null;
+      const cr = r.headers.get('content-range') || '';
+      const totalBytes = cr.includes('/') ? cr.split('/')[1] : '';
+      return { itag, target, ct, clen: totalBytes && totalBytes !== '*' ? totalBytes : undefined };
+    }),
+  );
+
+  const adaptiveFormats: AdaptiveFormat[] = [];
+  const formatStreams: FormatStream[] = [];
+  for (const res of results) {
+    if (res.status !== 'fulfilled' || !res.value) continue;
+    const { itag, target, clen } = res.value;
+    const meta = ITAG_CATALOG[itag];
+    if (!meta) continue;
+    if (meta.isProgressive) {
+      formatStreams.push({
+        url: target,
+        proxyUrl: `/api/v1/stream/googlevideo/${encodeURIComponent(videoId)}?itag=${encodeURIComponent(itag)}`,
+        itag,
+        type: meta.mime,
+        quality: meta.qualityLabel,
+        bitrate: meta.bitrate,
+        container: meta.container,
+        encoding: meta.encoding,
+        qualityLabel: meta.qualityLabel,
+        resolution: meta.qualityLabel,
+      });
+    } else {
+      adaptiveFormats.push({
+        bitrate: meta.bitrate,
+        url: target,
+        proxyUrl: `/latest_version?id=${encodeURIComponent(videoId)}&itag=${encodeURIComponent(itag)}`,
+        itag,
+        type: meta.mime,
+        clen,
+        container: meta.container,
+        encoding: meta.encoding,
+        qualityLabel: meta.qualityLabel,
+        resolution: meta.isAudio ? '' : meta.qualityLabel,
+        fps: meta.fps,
+        audioQuality: meta.isAudio ? 'AUDIO_QUALITY_MEDIUM' : undefined,
+      });
+    }
+  }
+  return { adaptiveFormats, formatStreams };
+}
+
+async function extractCompanionAndPoketubeStreams(videoId: string): Promise<Partial<VideoResponse> | null> {
+  const [pokeWatchRes, dashMpdRes, probeRes] = await Promise.allSettled([
+    (async () => {
+      const target = `${POKETUBE_BASE}/watch?v=${encodeURIComponent(videoId)}`;
+      const r = await fetchWithAnubis(target, { signal: AbortSignal.timeout(7000) });
+      if (!r.ok) return null;
+      const html = await r.text();
+      if (html.includes('anubis_challenge')) return null;
+
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const rawAdp = extractBalancedJsonArray(html, 'adaptiveFormats') as any[];
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const rawFmt = extractBalancedJsonArray(html, 'formatStreams') as any[];
+      const titleMatch = html.match(/<title>([^<]+)<\/title>/i);
+      const cleanTitle = titleMatch ? titleMatch[1].replace(/\s*-\s*PokeTube.*$/i, '').trim() : '';
+
+      const adaptiveFormats: AdaptiveFormat[] = [];
+      for (const f of rawAdp) {
+        const itag = String(f?.itag || '').trim();
+        if (!itag) continue;
+        const mime = String(f?.type || ITAG_CATALOG[itag]?.mime || 'video/mp4');
+        const isAudio = mime.startsWith('audio/');
+        const container = mime.includes('webm') ? 'webm' : 'mp4';
+        const codecMatch = mime.match(/codecs="([^"]+)"/);
+        adaptiveFormats.push({
+          bitrate: String(f?.bitrate || ITAG_CATALOG[itag]?.bitrate || '0'),
+          url: companionStreamUrl(videoId, itag),
+          proxyUrl: `/latest_version?id=${encodeURIComponent(videoId)}&itag=${encodeURIComponent(itag)}`,
+          itag,
+          type: mime,
+          clen: f?.clen ? String(f.clen) : undefined,
+          container,
+          encoding: codecMatch ? codecMatch[1] : String(f?.encoding || container),
+          qualityLabel: String(f?.qualityLabel || ITAG_CATALOG[itag]?.qualityLabel || (isAudio ? 'Audio' : '')),
+          resolution: String(f?.qualityLabel || ITAG_CATALOG[itag]?.qualityLabel || ''),
+          fps: typeof f?.fps === 'number' ? f.fps : ITAG_CATALOG[itag]?.fps,
+          audioQuality: isAudio ? String(f?.audioQuality || 'AUDIO_QUALITY_MEDIUM') : undefined,
+        });
+      }
+
+      const formatStreams: FormatStream[] = [];
+      for (const f of rawFmt) {
+        const itag = String(f?.itag || '').trim();
+        if (!itag) continue;
+        const mime = String(f?.type || ITAG_CATALOG[itag]?.mime || 'video/mp4');
+        formatStreams.push({
+          url: companionStreamUrl(videoId, itag),
+          proxyUrl: `/api/v1/stream/googlevideo/${encodeURIComponent(videoId)}?itag=${encodeURIComponent(itag)}`,
+          itag,
+          type: mime,
+          quality: String(f?.quality || f?.qualityLabel || '360p'),
+          container: mime.includes('webm') ? 'webm' : 'mp4',
+          encoding: String(f?.encoding || 'h264+aac'),
+          qualityLabel: String(f?.qualityLabel || f?.quality || '360p'),
+          resolution: String(f?.qualityLabel || f?.quality || '360p'),
+        });
+      }
+
+      return { title: cleanTitle || undefined, adaptiveFormats, formatStreams };
+    })(),
+
+    (async () => {
+      const r = await proxiedFetch(`${COMPANION_BASES[0]}/api/manifest/dash/id/${encodeURIComponent(videoId)}`, {
+        headers: { 'User-Agent': ANUBIS_UA },
+        signal: AbortSignal.timeout(4500),
+      });
+      if (!r.ok) return null;
+      const xml = await r.text();
+      const adaptiveFormats: AdaptiveFormat[] = [];
+      const adaptRegex = /<AdaptationSet\s+([^>]+)>([\s\S]*?)<\/AdaptationSet>/g;
+      let am: RegExpExecArray | null;
+      while ((am = adaptRegex.exec(xml)) !== null) {
+        const asetAttrs = am[1];
+        const asetBody = am[2];
+        const mimeBase = asetAttrs.match(/mimeType="([^"]+)"/)?.[1] || 'video/mp4';
+        const isAudio = mimeBase.startsWith('audio/');
+        const repRegex = /<Representation\s+([^>]+)>([\s\S]*?)<\/Representation>/g;
+        let rm: RegExpExecArray | null;
+        while ((rm = repRegex.exec(asetBody)) !== null) {
+          const rattrs = rm[1];
+          const rawId = rattrs.match(/\bid="([^"]+)"/)?.[1] || '';
+          const itag = rawId.replace(/[^0-9]/g, '') || rawId;
+          if (!itag) continue;
+          const bw = rattrs.match(/\bbandwidth="([^"]+)"/)?.[1] || '0';
+          const codecs = rattrs.match(/\bcodecs="([^"]+)"/)?.[1] || '';
+          const height = rattrs.match(/\bheight="([^"]+)"/)?.[1];
+          const fps = Number(rattrs.match(/\bframeRate="([^"]+)"/)?.[1] || 0) || undefined;
+          const qLabel = isAudio
+            ? `Audio ${Math.round(Number(bw) / 1000)}k`
+            : height
+              ? `${height}p${fps && fps >= 50 ? fps : ''}`
+              : ITAG_CATALOG[itag]?.qualityLabel || '';
+          adaptiveFormats.push({
+            bitrate: bw,
+            url: companionStreamUrl(videoId, itag),
+            proxyUrl: `/latest_version?id=${encodeURIComponent(videoId)}&itag=${encodeURIComponent(itag)}`,
+            itag,
+            type: codecs ? `${mimeBase}; codecs="${codecs}"` : mimeBase,
+            container: mimeBase.includes('webm') ? 'webm' : 'mp4',
+            encoding: codecs || (mimeBase.includes('webm') ? 'vp9' : 'avc1'),
+            qualityLabel: qLabel,
+            resolution: isAudio ? '' : qLabel,
+            fps,
+            audioQuality: isAudio ? 'AUDIO_QUALITY_MEDIUM' : undefined,
+          });
+        }
+      }
+      return { adaptiveFormats };
+    })(),
+
+    probeCompanionItags(videoId),
+  ]);
+
+  const adpMap = new Map<string, AdaptiveFormat>();
+  const fmtMap = new Map<string, FormatStream>();
+
+  const pokeData = pokeWatchRes.status === 'fulfilled' ? pokeWatchRes.value : null;
+  const mpdData = dashMpdRes.status === 'fulfilled' ? dashMpdRes.value : null;
+  const probeData = probeRes.status === 'fulfilled' ? probeRes.value : null;
+
+  for (const f of [...(probeData?.adaptiveFormats || []), ...(mpdData?.adaptiveFormats || []), ...(pokeData?.adaptiveFormats || [])]) {
+    if (!f.itag) continue;
+    const prev = adpMap.get(f.itag);
+    adpMap.set(f.itag, { ...prev, ...f, clen: f.clen || prev?.clen });
+  }
+  for (const f of [...(probeData?.formatStreams || []), ...(pokeData?.formatStreams || [])]) {
+    if (!f.itag) continue;
+    fmtMap.set(f.itag, f);
+  }
+
+  // Ensure itag 18 progressive stream is always present if any video/audio exists and 18 wasn't dropped
+  if (fmtMap.size === 0 && (adpMap.size > 0)) {
+    const meta18 = ITAG_CATALOG['18'];
+    fmtMap.set('18', {
+      url: companionStreamUrl(videoId, '18'),
+      proxyUrl: `/api/v1/stream/googlevideo/${encodeURIComponent(videoId)}?itag=18`,
+      itag: '18',
+      type: meta18.mime,
+      quality: '360p',
+      bitrate: meta18.bitrate,
+      container: 'mp4',
+      encoding: 'h264+aac',
+      qualityLabel: '360p',
+      resolution: '360p',
+    });
+  }
+
+  const adaptiveFormats = [...adpMap.values()];
+  const formatStreams = [...fmtMap.values()];
+  if (adaptiveFormats.length === 0 && formatStreams.length === 0) {
+    return null;
+  }
+
+  return {
+    title: pokeData?.title,
+    adaptiveFormats,
+    formatStreams,
+    directStreamAvailable: true,
+    upstreamSource: pokeData?.adaptiveFormats?.length ? 'kuro-companion+poketube' : 'kuro-companion-edge',
+  };
+}
+
+async function fetchUpstreamMediaWithFailover(
+  videoId: string,
+  itag: string,
+  primaryUrl: string,
+  rangeHeader?: string,
+): Promise<Response> {
+  const candidates: string[] = [];
+  if (primaryUrl) candidates.push(primaryUrl);
+  const compUrl = companionStreamUrl(videoId, itag);
+  if (!candidates.includes(compUrl)) candidates.push(compUrl);
+  const pokeUrl = poketubeDownloadUrl(videoId, itag);
+  if (!candidates.includes(pokeUrl)) candidates.push(pokeUrl);
+
+  let lastRes: Response | null = null;
+  for (const target of candidates) {
+    try {
+      const headers = buildMaskedUpstreamHeaders(rangeHeader, target);
+      const r = target.includes('poketube.fun/api/')
+        ? await fetchWithAnubis(target, { headers, signal: AbortSignal.timeout(18000) })
+        : await proxiedFetch(target, { headers, signal: AbortSignal.timeout(18000) });
+
+      const ct = (r.headers.get('content-type') || '').toLowerCase();
+      if (r.ok && !ct.includes('text/html') && !ct.includes('text/plain')) {
+        return r;
+      }
+      lastRes = r;
+    } catch {
+      // try next upstream candidate
+    }
+  }
+  if (lastRes) return lastRes;
+  throw new Error('上流メディアストリームの取得に失敗しました');
+}
+
+// ---------------------------------------------------------------------------
+// Core Video Extractor (Companion+PokeTube + InnerTube + External Proxy + oEmbed)
 // ---------------------------------------------------------------------------
 async function fetchVideoFull(videoId: string): Promise<VideoResponse> {
   const ytPromiseLocal = getYt().catch(() => null);
 
-  const [infoResult, oembedResult, externalProxyResult, directStreamResult] = await Promise.allSettled([
+  const [infoResult, oembedResult, externalProxyResult, directStreamResult, companionResult] = await Promise.allSettled([
     ytPromiseLocal.then((yt) => (yt ? yt.getInfo(videoId) : null)),
     proxiedFetch(
       `https://www.youtube.com/oembed?url=https://www.youtube.com/watch?v=${encodeURIComponent(videoId)}&format=json`,
@@ -1552,6 +2000,7 @@ async function fetchVideoFull(videoId: string): Promise<VideoResponse> {
     ).then((r) => (r.ok ? r.json() : null)),
     fetchVideoViaExternalProxy(videoId),
     ytPromiseLocal.then((yt) => (yt ? extractDirectInnertubeStreams(yt, videoId) : null)),
+    extractCompanionAndPoketubeStreams(videoId),
   ]);
 
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -1560,19 +2009,21 @@ async function fetchVideoFull(videoId: string): Promise<VideoResponse> {
   const oembed: any = oembedResult.status === 'fulfilled' ? oembedResult.value : null;
   const raceData = externalProxyResult.status === 'fulfilled' ? externalProxyResult.value : null;
   const directData = directStreamResult.status === 'fulfilled' ? directStreamResult.value : null;
+  const companionData = companionResult.status === 'fulfilled' ? companionResult.value : null;
 
   const title =
     info?.primary_info?.title?.text ||
     info?.basic_info?.title ||
-    raceData?.title ||
     oembed?.title ||
+    companionData?.title ||
+    raceData?.title ||
     `Video ${videoId}`;
 
   const author =
     info?.secondary_info?.owner?.author?.name ||
     info?.basic_info?.author ||
-    raceData?.author ||
     oembed?.author_name ||
+    raceData?.author ||
     'YouTube Creator';
 
   const authorId =
@@ -1699,18 +2150,22 @@ async function fetchVideoFull(videoId: string): Promise<VideoResponse> {
   }
 
   const adaptiveFormats: AdaptiveFormat[] =
-    directData?.adaptiveFormats?.length
-      ? directData.adaptiveFormats
-      : raceData?.adaptiveFormats?.length
-        ? raceData.adaptiveFormats
-        : [];
+    companionData?.adaptiveFormats?.length
+      ? companionData.adaptiveFormats
+      : directData?.adaptiveFormats?.length
+        ? directData.adaptiveFormats
+        : raceData?.adaptiveFormats?.length
+          ? raceData.adaptiveFormats
+          : [];
 
   const formatStreams: FormatStream[] =
-    directData?.formatStreams?.length
-      ? directData.formatStreams
-      : raceData?.formatStreams?.length
-        ? raceData.formatStreams
-        : [];
+    companionData?.formatStreams?.length
+      ? companionData.formatStreams
+      : directData?.formatStreams?.length
+        ? directData.formatStreams
+        : raceData?.formatStreams?.length
+          ? raceData.formatStreams
+          : [];
 
   // Cache stream URLs for /latest_version, /api/v1/stream/mux, /api/v1/stream/googlevideo, and /api/v1/download proxying
   for (const fmt of [...adaptiveFormats, ...formatStreams]) {
@@ -1741,23 +2196,36 @@ async function fetchVideoFull(videoId: string): Promise<VideoResponse> {
               ? '2160p60 4K'
               : '1080p HD';
 
-  const topInvRelay = getRankedExternalCandidates(
-    'invidious',
-    [streamConfig.customUpstreamUrl || 'https://yt.chocolatemoo53.com'],
-  )[0] || 'https://yt.chocolatemoo53.com';
-  const relayHost = topInvRelay.replace(/^https?:\/\//, '');
   const clientRelayStreams = [
     {
-      label: '720p HD (サーバー保護MP4リレー)',
-      itag: '22',
-      host: relayHost,
-      url: `/api/v1/stream/relay/${encodeURIComponent(videoId)}?host=${encodeURIComponent(relayHost)}&itag=22`,
+      label: 'Server 1 · 超高速Range MP4 (itag 18)',
+      itag: '18',
+      host: 'kuro-srv-1:3001',
+      url: `/api/server/1/stream/${encodeURIComponent(videoId)}`,
     },
     {
-      label: '360p (サーバー保護MP4リレー)',
+      label: 'Server 2 · 高画質1080p/4K Mux MP4',
+      itag: 'mux',
+      host: 'kuro-srv-2:3002',
+      url: `/api/server/2/stream/${encodeURIComponent(videoId)}`,
+    },
+    {
+      label: 'Server 3 · Adaptive HLS (.m3u8)',
+      itag: 'hls',
+      host: 'kuro-srv-3:3003',
+      url: `/api/server/3/stream/${encodeURIComponent(videoId)}`,
+    },
+    {
+      label: 'Server 4 · 超安定 H.264/AAC MP4',
       itag: '18',
-      host: relayHost,
-      url: `/api/v1/stream/relay/${encodeURIComponent(videoId)}?host=${encodeURIComponent(relayHost)}&itag=18`,
+      host: 'kuro-srv-4:3004',
+      url: `/api/server/4/stream/${encodeURIComponent(videoId)}`,
+    },
+    {
+      label: 'Server 5 · 自律フォールバック統合',
+      itag: 'auto',
+      host: 'kuro-srv-5:3005',
+      url: `/api/server/5/stream/${encodeURIComponent(videoId)}`,
     },
   ];
 
@@ -1814,26 +2282,29 @@ async function fetchVideoFull(videoId: string): Promise<VideoResponse> {
     hlsProxyUrl,
     googlevideoProxyUrl,
     eduEmbed,
-    upstreamSource: directData?.source || raceData?.upstreamSource || 'innertube-edge',
+    upstreamSource: companionData?.upstreamSource || directData?.source || raceData?.upstreamSource || 'kuro-companion-edge',
   };
 }
 
 // ---------------------------------------------------------------------------
-// Self-Hosted Protected Invidious Origin (127.0.0.1:3001) +
-// Public Reverse Proxy Security Shield (0.0.0.0:3000)
+// 5 Dedicated Stream-Capable Origin Servers (127.0.0.1:3001-3005) +
+// Public Headless API Reverse Proxy Gateway (0.0.0.0:3000)
 // ---------------------------------------------------------------------------
 const ORIGIN_PORT = 3001;
-const ORIGIN_PORTS = [3001, 3002, 3003, 3004, 3005, 3006, 3007, 3008, 3009, 3010] as const;
+const ORIGIN_PORTS = [3001, 3002, 3003, 3004, 3005] as const;
 const ORIGIN_HOST = '127.0.0.1';
 const ORIGIN_AUTH_TOKEN = crypto.randomBytes(32).toString('hex');
 
 interface OriginInstanceDef {
   id: string;
+  serverNumber: number;
   name: string;
   port: number;
   tier: ServerTier;
   tierLabel: string;
   endpoint: string;
+  streamEndpoint: string;
+  infoEndpoint: string;
   protocol: string;
   capabilities: string[];
   priority: number;
@@ -1841,114 +2312,74 @@ interface OriginInstanceDef {
 
 const ORIGIN_INSTANCES: OriginInstanceDef[] = [
   {
-    id: 'kuro-inst-01',
-    name: '安定インスタンス1 · H.264 MP4 プロキシノード (:3001)',
+    id: 'kuro-srv-1',
+    serverNumber: 1,
+    name: 'Stream Server 1 · 超高速エッジ Range MP4 (:3001)',
     port: 3001,
-    tier: 'stable',
-    tierLabel: '安定型',
-    endpoint: '/api/kuro/stable-stream/:id',
-    protocol: 'HTTP/1.1 Keep-Alive · MP4',
-    capabilities: ['H.264固定', '学校端末互換', 'AAC音声'],
+    tier: 'fast',
+    tierLabel: '超高速型',
+    endpoint: '/api/server/1/stream/:id',
+    streamEndpoint: '/api/server/1/stream/:id',
+    infoEndpoint: '/api/server/1/info/:id',
+    protocol: 'HTTP/1.1 206 Range · Keep-Alive MP4',
+    capabilities: ['超高速起動', 'HTTP 206 シーク', 'Companion直結'],
     priority: 1,
   },
   {
-    id: 'kuro-inst-02',
-    name: '安定インスタンス2 · プロキシ動画情報＆検索クラスタ (:3002)',
+    id: 'kuro-srv-2',
+    serverNumber: 2,
+    name: 'Stream Server 2 · 超高画質 FFmpeg Mux 4K/1080p (:3002)',
     port: 3002,
-    tier: 'stable',
-    tierLabel: '安定型',
-    endpoint: '/api/v1/videos/:id',
-    protocol: 'HTTP/1.1 Keep-Alive · JSON',
-    capabilities: ['プロキシ経由メタ取得', '検索・予測補完', '関連動画保証'],
-    priority: 2,
+    tier: 'hq',
+    tierLabel: '高画質型',
+    endpoint: '/api/server/2/stream/:id',
+    streamEndpoint: '/api/server/2/stream/:id',
+    infoEndpoint: '/api/server/2/info/:id',
+    protocol: 'Fragmented MP4 · Zero-Transcode Copy',
+    capabilities: ['4K/1080p60高画質', 'FFmpegリアルタイム結合', '高音質AAC'],
+    priority: 1,
   },
   {
-    id: 'kuro-inst-03',
-    name: '安定インスタンス3 · Edu (Classroom/Kahoot) ゲートウェイ (:3003)',
+    id: 'kuro-srv-3',
+    serverNumber: 3,
+    name: 'Stream Server 3 · Adaptive HLS (.m3u8) (:3003)',
     port: 3003,
-    tier: 'stable',
-    tierLabel: '安定型 (Edu)',
-    endpoint: '/api/kuro/edu-embed/:id',
-    protocol: 'IFrame JS API · Edu',
-    capabilities: ['youtubeeducation.com', 'Google Classroom', 'Kahoot!'],
-    priority: 3,
+    tier: 'hq',
+    tierLabel: '高画質HLS型',
+    endpoint: '/api/server/3/stream/:id',
+    streamEndpoint: '/api/server/3/stream/:id',
+    infoEndpoint: '/api/server/3/info/:id',
+    protocol: 'HLS MPEG-TS (.m3u8 + .ts)',
+    capabilities: ['Adaptive HLS', '無停止高速シーク', 'H.264+AAC Copy'],
+    priority: 2,
   },
   {
-    id: 'kuro-inst-04',
-    name: '高速インスタンス4 · Googlevideo IP秘匿 Range エッジ (:3004)',
+    id: 'kuro-srv-4',
+    serverNumber: 4,
+    name: 'Stream Server 4 · 超安定 H.264/AAC 端末互換 (:3004)',
     port: 3004,
-    tier: 'fast',
-    tierLabel: '高速型',
-    endpoint: '/api/v1/stream/googlevideo/:id',
-    protocol: 'HTTP 206 Range · Keep-Alive',
-    capabilities: ['IPヘッダー遮蔽', 'UA擬装', '0ms先読み'],
-    priority: 1,
-  },
-  {
-    id: 'kuro-inst-05',
-    name: '高速インスタンス5 · マルチノード並列レーサー＆先読み (:3005)',
-    port: 3005,
-    tier: 'fast',
-    tierLabel: '高速型',
-    endpoint: '/api/kuro/fast-stream/:id',
-    protocol: 'Promise.any Race · Prefetch',
-    capabilities: ['L1メモリ直結', '先読みプリフェッチ', '低遅延'],
-    priority: 2,
-  },
-  {
-    id: 'kuro-inst-06',
-    name: '高速インスタンス6 · メディア・サムネイル中継プロキシ (:3006)',
-    port: 3006,
-    tier: 'fast',
-    tierLabel: '高速型',
-    endpoint: '/api/v1/media-proxy',
-    protocol: 'SSRF-Safe Proxy · Cached',
-    capabilities: ['画像/アイコン中継', 'IP非露出', 'キャッシュ配信'],
-    priority: 3,
-  },
-  {
-    id: 'kuro-inst-07',
-    name: '高画質インスタンス7 · 4K60 HDR + FFmpeg MP4結合 (:3007)',
-    port: 3007,
-    tier: 'hq',
-    tierLabel: '高画質型',
-    endpoint: '/api/kuro/hq-stream/:id',
-    protocol: 'WebPo + FFmpeg Mux',
-    capabilities: ['2160p60 4K', 'HDR10/AV1', 'MP4リアルタイム結合'],
-    priority: 1,
-  },
-  {
-    id: 'kuro-inst-08',
-    name: '高画質インスタンス8 · Adaptive HLS (.m3u8) 生成ノード (:3008)',
-    port: 3008,
-    tier: 'hq',
-    tierLabel: '高画質型',
-    endpoint: '/api/v1/stream/hls-gen/:id/index.m3u8',
-    protocol: 'HLS / MPEG-TS',
-    capabilities: ['適応ビットレート', '無停止10秒スキップ', '4K対応'],
-    priority: 2,
-  },
-  {
-    id: 'kuro-inst-09',
-    name: '高画質インスタンス9 · BotGuard WebPo & 高音質リレー (:3009)',
-    port: 3009,
-    tier: 'hq',
-    tierLabel: '高画質型',
-    endpoint: '/api/v1/stream/relay/:id',
-    protocol: 'WebPo + Safe Relay',
-    capabilities: ['POトークン生成', '安全リレー検証', '1080p60+'],
-    priority: 3,
-  },
-  {
-    id: 'kuro-inst-10',
-    name: '統合復旧インスタンス10 · Invidious/Zernio 自動探索ノード (:3010)',
-    port: 3010,
     tier: 'stable',
-    tierLabel: '復旧・探索型',
-    endpoint: '/api/kuro/live-servers',
-    protocol: '2-Stage Stream Verify',
-    capabilities: ['生存ノード自動ランキング', 'ストリーム実抽出検証', '自動復旧'],
-    priority: 4,
+    tierLabel: '超安定型',
+    endpoint: '/api/server/4/stream/:id',
+    streamEndpoint: '/api/server/4/stream/:id',
+    infoEndpoint: '/api/server/4/info/:id',
+    protocol: 'Universal H.264/AAC Progressive MP4',
+    capabilities: ['学校端末100%互換', '多重リトライ', 'iOS/Android/PC対応'],
+    priority: 1,
+  },
+  {
+    id: 'kuro-srv-5',
+    serverNumber: 5,
+    name: 'Stream Server 5 · 自律フォールバック & 外部レース統合 (:3005)',
+    port: 3005,
+    tier: 'stable',
+    tierLabel: '統合フォールバック型',
+    endpoint: '/api/server/5/stream/:id',
+    streamEndpoint: '/api/server/5/stream/:id',
+    infoEndpoint: '/api/server/5/info/:id',
+    protocol: 'Multi-Source Race · Auto-Failover MP4',
+    capabilities: ['全ソース並列レース', '自動復旧', '1080p→360p安全降格'],
+    priority: 2,
   },
 ];
 
@@ -1957,32 +2388,23 @@ let rrCursor = 0;
 
 function pickOriginPortForPath(reqUrl: string): number[] {
   const pathLower = reqUrl.toLowerCase();
+  const explicitMatch = pathLower.match(/^\/api\/server\/([1-5])(?:\/|\?|$)/);
+  if (explicitMatch) {
+    const pinnedPort = 3000 + Number(explicitMatch[1]);
+    return [pinnedPort, ...ORIGIN_PORTS.filter((p) => p !== pinnedPort)];
+  }
+
   let preferredPool: readonly number[];
-  if (pathLower.includes('/edu-embed') || pathLower.includes('/stable-stream')) {
-    preferredPool = [3001, 3002, 3003];
-  } else if (
-    pathLower.includes('/googlevideo') ||
-    pathLower.includes('/fast-stream') ||
-    pathLower.includes('/thumbnail') ||
-    pathLower.includes('/media-proxy') ||
-    pathLower.includes('/prefetch')
-  ) {
-    preferredPool = [3004, 3005, 3006];
-  } else if (
-    pathLower.includes('/hq-stream') ||
-    pathLower.includes('/stream/mux') ||
-    pathLower.includes('/stream/hls') ||
-    pathLower.includes('/4k-stream') ||
-    pathLower.includes('/stream/relay')
-  ) {
-    preferredPool = [3007, 3008, 3009];
-  } else if (
-    pathLower.includes('/external-recover') ||
-    pathLower.includes('/live-servers') ||
-    pathLower.includes('/nodes/') ||
-    pathLower.includes('/translate')
-  ) {
-    preferredPool = [3010, 3002, 3005];
+  if (pathLower.includes('/googlevideo') || pathLower.includes('/fast-stream') || pathLower.includes('/latest_version')) {
+    preferredPool = [3001, 3005];
+  } else if (pathLower.includes('/hq-stream') || pathLower.includes('/stream/mux') || pathLower.includes('/4k-stream')) {
+    preferredPool = [3002, 3005];
+  } else if (pathLower.includes('/stream/hls')) {
+    preferredPool = [3003, 3002];
+  } else if (pathLower.includes('/stable-stream') || pathLower.includes('/edu-embed')) {
+    preferredPool = [3004, 3001];
+  } else if (pathLower.includes('/auto-fallback') || pathLower.includes('/external-recover') || pathLower.includes('/live-servers')) {
+    preferredPool = [3005, 3001, 3004];
   } else {
     preferredPool = ORIGIN_PORTS;
   }
@@ -2696,60 +3118,38 @@ async function startServer(): Promise<void> {
     }
   });
 
-  // 11. GET /latest_version (Ultra-stable self-healing Range stream proxy)
+  // 11. GET /latest_version (Ultra-stable self-healing Range stream proxy with upstream failover)
   app.get('/latest_version', async (req, res) => {
     const id = String(req.query.id || '').trim();
-    const itag = String(req.query.itag || '').trim();
-    if (!id || !itag) {
-      res.status(400).json({ error: 'Missing id or itag parameter' });
+    const itag = String(req.query.itag || '18').trim();
+    if (!/^[a-zA-Z0-9_-]{6,20}$/.test(id) || !itag) {
+      res.status(400).json({ error: 'Missing or invalid id or itag parameter' });
       return;
     }
 
     let cached = cacheGet<{ url: string; type: string }>(`stream:${id}:${itag}`);
     if (!cached.hit || !cached.data?.url) {
-      // Auto-populate cache on demand if direct URL wasn't cached yet
       try {
         await fetchVideoFull(id);
         cached = cacheGet<{ url: string; type: string }>(`stream:${id}:${itag}`);
       } catch {
-        // ignore
+        // ignore, failover handles companion direct URL
       }
     }
-    if (!cached.hit || !cached.data?.url) {
-      res.status(404).json({ error: 'Direct stream URL not cached for this itag; fetch /api/v1/videos/:id first' });
-      return;
-    }
-
-    const fetchWithUpstream = async (targetUrl: string) => {
-      return proxiedFetch(targetUrl, {
-        headers: buildMaskedUpstreamHeaders(req.headers.range, targetUrl),
-        signal: AbortSignal.timeout(20000),
-      });
-    };
+    const targetUrl = cached.data?.url || companionStreamUrl(id, itag);
 
     try {
-      let upstream = await fetchWithUpstream(cached.data.url);
-      // Self-healing retry if signed googlevideo URL expired (403/410/404)
-      if ((upstream.status === 403 || upstream.status === 410 || upstream.status === 404) && !req.query.retried) {
-        const refreshed = await fetchVideoFull(id).catch(() => null);
-        if (refreshed) {
-          cacheSet(`video:${id}`, refreshed, 300_000, refreshed.upstreamSource || 'innertube-edge');
-          const freshCached = cacheGet<{ url: string; type: string }>(`stream:${id}:${itag}`);
-          if (freshCached.hit && freshCached.data?.url) {
-            upstream = await fetchWithUpstream(freshCached.data.url);
-          }
-        }
-      }
+      const upstream = await fetchUpstreamMediaWithFailover(id, itag, targetUrl, req.headers.range);
 
       res.status(upstream.status);
-      const ct = upstream.headers.get('content-type');
+      const ct = upstream.headers.get('content-type') || (itag === '140' ? 'audio/mp4' : itag === '251' ? 'audio/webm' : 'video/mp4');
       const cl = upstream.headers.get('content-length');
       const cr = upstream.headers.get('content-range');
-      const ar = upstream.headers.get('accept-ranges');
-      if (ct) res.setHeader('Content-Type', ct);
+      const ar = upstream.headers.get('accept-ranges') || 'bytes';
+      res.setHeader('Content-Type', ct);
+      res.setHeader('Accept-Ranges', ar);
       if (cl) res.setHeader('Content-Length', cl);
       if (cr) res.setHeader('Content-Range', cr);
-      if (ar) res.setHeader('Accept-Ranges', ar);
 
       if (!upstream.body) {
         res.end();
@@ -2772,77 +3172,183 @@ async function startServer(): Promise<void> {
     }
   });
 
+  // Helper: Stream FFmpeg-muxed HD/1080p/4K MP4 cleanly with first-byte verification + progressive fallback
+  async function streamMuxedMp4Response(
+    videoId: string,
+    res: express.Response,
+    opts: { maxHeight?: number; seekSec?: number; vItag?: string; aItag?: string; rangeHeader?: string } = {},
+  ): Promise<void> {
+    const maxHeight = opts.maxHeight || 2160;
+    const seekSec = Math.max(0, Number(opts.seekSec || 0) || 0);
+    let video = cacheGet<VideoResponse>(`video:${videoId}`).data;
+    if (!video || (!video.adaptiveFormats?.length && !video.formatStreams?.length)) {
+      video = await fetchVideoFull(videoId).catch(() => undefined);
+      if (video) cacheSet(`video:${videoId}`, video, 300_000, video.upstreamSource || 'kuro-companion');
+    }
+
+    const vTracks = (video?.adaptiveFormats || [])
+      .filter((f) => f.type.startsWith('video/') && f.url)
+      .sort((a, b) => {
+        const hA = parseInt(a.qualityLabel || '0', 10) || 0;
+        const hB = parseInt(b.qualityLabel || '0', 10) || 0;
+        if (hB !== hA) return hB - hA;
+        // Prefer H.264 (avc1) for universal MP4 browser compatibility at equal resolution
+        const aH264 = /avc1/i.test(a.type + a.encoding) ? 1 : 0;
+        const bH264 = /avc1/i.test(b.type + b.encoding) ? 1 : 0;
+        if (bH264 !== aH264) return bH264 - aH264;
+        return (Number(b.bitrate) || 0) - (Number(a.bitrate) || 0);
+      });
+    const aTracks = (video?.adaptiveFormats || [])
+      .filter((f) => f.type.startsWith('audio/') && f.url)
+      .sort((a, b) => {
+        const aAac = /mp4a/i.test(a.type + a.encoding) ? 1 : 0;
+        const bAac = /mp4a/i.test(b.type + b.encoding) ? 1 : 0;
+        if (bAac !== aAac) return bAac - aAac;
+        return (Number(b.bitrate) || 0) - (Number(a.bitrate) || 0);
+      });
+
+    const vPicked =
+      (opts.vItag ? vTracks.find((v) => v.itag === opts.vItag) : null) ||
+      vTracks.find((v) => (parseInt(v.qualityLabel || '0', 10) || 0) <= maxHeight && /avc1/i.test(v.type + v.encoding)) ||
+      vTracks.find((v) => (parseInt(v.qualityLabel || '0', 10) || 0) <= maxHeight) ||
+      vTracks[0] ||
+      null;
+    const aPicked =
+      (opts.aItag ? aTracks.find((a) => a.itag === opts.aItag) : null) ||
+      aTracks[0] ||
+      null;
+
+    if (vPicked?.url && aPicked?.url && FFMPEG_AVAILABLE) {
+      const vUrl = vPicked.url;
+      const aUrl = aPicked.url;
+      const isAudioAac = /mp4a/i.test(aPicked.type + aPicked.encoding) || aPicked.itag === '140';
+      const ffArgs: string[] = ['-loglevel', 'error'];
+      if (streamConfig.outboundProxyUrl && /^https?:\/\//i.test(streamConfig.outboundProxyUrl)) {
+        ffArgs.push('-http_proxy', streamConfig.outboundProxyUrl);
+      }
+      ffArgs.push('-user_agent', ANUBIS_UA);
+      if (seekSec > 0) ffArgs.push('-ss', seekSec.toFixed(2));
+      ffArgs.push('-reconnect', '1', '-reconnect_streamed', '1', '-reconnect_delay_max', '3', '-i', vUrl);
+      ffArgs.push('-user_agent', ANUBIS_UA);
+      if (seekSec > 0) ffArgs.push('-ss', seekSec.toFixed(2));
+      ffArgs.push(
+        '-reconnect', '1', '-reconnect_streamed', '1', '-reconnect_delay_max', '3', '-i', aUrl,
+        '-map', '0:v:0',
+        '-map', '1:a:0',
+        '-c:v', 'copy',
+        ...(isAudioAac ? ['-c:a', 'copy'] : ['-c:a', 'aac', '-b:a', '192k']),
+        '-movflags', 'frag_keyframe+empty_moov+default_base_moof',
+        '-f', 'mp4',
+        'pipe:1',
+      );
+
+      const okMuxed = await new Promise<boolean>((resolve) => {
+        const ff = spawn(FFMPEG_BIN, ffArgs);
+        let started = false;
+        const startTimeout = setTimeout(() => {
+          if (!started) {
+            ff.kill('SIGKILL');
+            resolve(false);
+          }
+        }, 12_000);
+
+        res.on('close', () => {
+          clearTimeout(startTimeout);
+          if (!res.writableEnded) ff.kill('SIGKILL');
+          resolve(started);
+        });
+
+        ff.stdout.on('data', (chunk: Buffer) => {
+          if (!started) {
+            started = true;
+            clearTimeout(startTimeout);
+            if (!res.headersSent) {
+              res.status(200);
+              res.setHeader('Content-Type', 'video/mp4');
+              res.setHeader('Cache-Control', 'no-store');
+              res.setHeader('X-Stream-Mode', 'ffmpeg-mux-copy');
+              res.setHeader('X-Stream-Quality', vPicked.qualityLabel || vPicked.itag);
+            }
+          }
+          if (!res.writableEnded) res.write(chunk);
+        });
+
+        ff.stdout.on('end', () => {
+          clearTimeout(startTimeout);
+          if (started && !res.writableEnded) res.end();
+          resolve(started);
+        });
+
+        ff.on('error', () => {
+          clearTimeout(startTimeout);
+          resolve(started);
+        });
+
+        ff.on('exit', () => {
+          clearTimeout(startTimeout);
+          if (started && !res.writableEnded) res.end();
+          resolve(started);
+        });
+      });
+
+      if (okMuxed) return;
+    }
+
+    // Fallback: Guaranteed Progressive H.264/AAC MP4 (itag=18) with full HTTP 206 Range support
+    const progItag = video?.formatStreams?.[0]?.itag || '18';
+    const progUrl = video?.formatStreams?.[0]?.url || companionStreamUrl(videoId, progItag);
+    const upstream = await fetchUpstreamMediaWithFailover(videoId, progItag, progUrl, opts.rangeHeader);
+    if (res.headersSent) return;
+    res.status(upstream.status);
+    res.setHeader('Content-Type', upstream.headers.get('content-type') || 'video/mp4');
+    res.setHeader('Accept-Ranges', upstream.headers.get('accept-ranges') || 'bytes');
+    res.setHeader('X-Stream-Mode', 'progressive-fallback');
+    const cl = upstream.headers.get('content-length');
+    const cr = upstream.headers.get('content-range');
+    if (cl) res.setHeader('Content-Length', cl);
+    if (cr) res.setHeader('Content-Range', cr);
+    if (!upstream.body) {
+      res.end();
+      return;
+    }
+    const reader = upstream.body.getReader();
+    res.on('close', () => {
+      if (!res.writableEnded) reader.cancel().catch(() => {});
+    });
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (!res.writableEnded) res.write(Buffer.from(value));
+    }
+    res.end();
+  }
+
   // 12. GET /api/v1/stream/mux (Real-time FFmpeg 4K/1080p video + audio fragmented MP4 remuxer with ?t= seek support)
   app.get('/api/v1/stream/mux', async (req, res) => {
     const id = String(req.query.id || '').trim();
-    const vItag = String(req.query.v || '').trim();
-    const aItag = String(req.query.a || '').trim();
+    const vItag = String(req.query.v || '').trim() || undefined;
+    const aItag = String(req.query.a || '').trim() || undefined;
+    const maxHeight = Number(req.query.maxHeight || req.query.q || 2160) || 2160;
     const seekSec = Math.max(0, Number(req.query.t || 0) || 0);
 
-    if (!id || !vItag || !aItag) {
-      res.status(400).json({ error: 'id, v, and a itag parameters are required' });
+    if (!/^[a-zA-Z0-9_-]{6,20}$/.test(id)) {
+      res.status(400).json({ error: 'Valid video id parameter is required' });
       return;
     }
 
-    let vCached = cacheGet<{ url: string }>(`stream:${id}:${vItag}`);
-    let aCached = cacheGet<{ url: string }>(`stream:${id}:${aItag}`);
-    if (!vCached.hit || !vCached.data?.url || !aCached.hit || !aCached.data?.url) {
-      try {
-        const refreshed = await fetchVideoFull(id);
-        cacheSet(`video:${id}`, refreshed, 300_000, refreshed.upstreamSource || 'innertube-edge');
-        vCached = cacheGet<{ url: string }>(`stream:${id}:${vItag}`);
-        aCached = cacheGet<{ url: string }>(`stream:${id}:${aItag}`);
-      } catch {
-        // ignore
+    try {
+      await streamMuxedMp4Response(id, res, {
+        maxHeight,
+        seekSec,
+        vItag,
+        aItag,
+        rangeHeader: req.headers.range,
+      });
+    } catch (err) {
+      if (!res.headersSent) {
+        res.status(502).json({ error: err instanceof Error ? err.message : 'Mux stream failed' });
       }
     }
-    if (!vCached.hit || !vCached.data?.url || !aCached.hit || !aCached.data?.url) {
-      res.status(404).json({ error: 'Stream URLs not found in cache. Fetch /api/v1/videos/:id first.' });
-      return;
-    }
-
-    res.setHeader('Content-Type', 'video/mp4');
-    res.setHeader('Cache-Control', 'no-store');
-
-    const ffArgs: string[] = ['-loglevel', 'error'];
-    if (streamConfig.outboundProxyUrl && /^https?:\/\//i.test(streamConfig.outboundProxyUrl)) {
-      ffArgs.push('-http_proxy', streamConfig.outboundProxyUrl);
-    }
-    const ua = getUpstreamUaForUrl(vCached.data.url);
-    ffArgs.push('-user_agent', ua);
-    if (seekSec > 0) ffArgs.push('-ss', seekSec.toFixed(2));
-    ffArgs.push(
-      '-reconnect', '1',
-      '-reconnect_streamed', '1',
-      '-reconnect_delay_max', '3',
-      '-i', vCached.data.url,
-    );
-    ffArgs.push('-user_agent', getUpstreamUaForUrl(aCached.data.url));
-    if (seekSec > 0) ffArgs.push('-ss', seekSec.toFixed(2));
-    ffArgs.push(
-      '-reconnect', '1',
-      '-reconnect_streamed', '1',
-      '-reconnect_delay_max', '3',
-      '-i', aCached.data.url,
-      '-map', '0:v:0',
-      '-map', '1:a:0',
-      '-c:v', 'copy',
-      '-c:a', 'aac',
-      '-b:a', '192k',
-      '-movflags', 'frag_keyframe+empty_moov+default_base_moof',
-      '-f', 'mp4',
-      'pipe:1',
-    );
-
-    const ff = spawn(FFMPEG_BIN, ffArgs);
-
-    ff.stdout.pipe(res);
-    res.on('close', () => {
-      if (!res.writableEnded) ff.kill('SIGKILL');
-    });
-    ff.on('error', () => {
-      if (!res.headersSent) res.status(502).end();
-    });
   });
 
   // 12b. GET /api/v1/stream/hls-proxy (Native HLS .m3u8 manifest & segment proxy)
@@ -2920,12 +3426,15 @@ async function startServer(): Promise<void> {
     }
   });
 
-  // 12c. GET /api/v1/stream/hls-gen/:id/:file (On-demand FFmpeg H.264/fMP4 HLS .m3u8 packager)
+  // 12c. Shared On-demand FFmpeg H.264/AAC HLS .m3u8 packager & handler
   const activeHlsJobs = new Map<string, { dir: string; startedAt: number }>();
 
-  app.get('/api/v1/stream/hls-gen/:id/:file', async (req, res) => {
-    const id = String(req.params.id || '').replace(/[^a-zA-Z0-9_-]/g, '');
-    const file = String(req.params.file || '');
+  async function serveHlsFile(
+    id: string,
+    file: string,
+    segmentPrefix: string,
+    res: express.Response,
+  ): Promise<void> {
     if (!id || !/^(index\.m3u8|seg_\d{4}\.ts)$/.test(file)) {
       res.status(400).json({ error: 'Invalid HLS request' });
       return;
@@ -2933,30 +3442,42 @@ async function startServer(): Promise<void> {
 
     const hlsDir = path.join('/tmp/kurostream-hls', id);
     const targetFile = path.join(hlsDir, file);
+    const playlistFile = path.join(hlsDir, 'index.m3u8');
 
-    if (file === 'index.m3u8' && !activeHlsJobs.has(id)) {
+    const needsBuild =
+      file === 'index.m3u8' &&
+      !activeHlsJobs.has(id) &&
+      (!fs.existsSync(playlistFile) || !fs.readFileSync(playlistFile, 'utf8').includes('.ts'));
+
+    if (needsBuild) {
       let video = cacheGet<VideoResponse>(`video:${id}`).data;
       if (!video || (!video.adaptiveFormats?.length && !video.formatStreams?.length)) {
         video = await fetchVideoFull(id).catch(() => video);
-        if (video) cacheSet(`video:${id}`, video, 300_000, video.upstreamSource || 'innertube-edge');
+        if (video) cacheSet(`video:${id}`, video, 300_000, video.upstreamSource || 'kuro-companion');
       }
 
       const vTracks = (video?.adaptiveFormats || [])
         .filter((f) => f.type.startsWith('video/') && f.url)
         .sort((a, b) => (parseInt(b.qualityLabel || '0', 10) || 0) - (parseInt(a.qualityLabel || '0', 10) || 0));
-      // MPEG-TS (.ts) copy requires H.264 (avc1); fallback to libx264 transcode only if no H.264 track exists
       const h264Adaptive = vTracks.find(
         (f) => f.encoding.toLowerCase().includes('avc1') || f.type.toLowerCase().includes('avc1'),
       );
       const aTracks = (video?.adaptiveFormats || [])
         .filter((f) => f.type.startsWith('audio/') && f.url)
-        .sort((a, b) => (Number(b.bitrate) || 0) - (Number(a.bitrate) || 0));
+        .sort((a, b) => {
+          const aAac = /mp4a/i.test(a.type + a.encoding) ? 1 : 0;
+          const bAac = /mp4a/i.test(b.type + b.encoding) ? 1 : 0;
+          if (bAac !== aAac) return bAac - aAac;
+          return (Number(b.bitrate) || 0) - (Number(a.bitrate) || 0);
+        });
       const prog = video?.formatStreams?.find((f) => f.container === 'mp4' && f.url) || video?.formatStreams?.[0];
 
       const pickedVideo = h264Adaptive || prog || vTracks[0];
-      const vUrl = pickedVideo?.url;
+      const vUrl = pickedVideo?.url || companionStreamUrl(id, '18');
       const needsTranscode = Boolean(pickedVideo && !h264Adaptive && pickedVideo !== prog);
-      const aUrl = pickedVideo !== prog && aTracks[0] ? aTracks[0].url : null;
+      const aPicked = pickedVideo !== prog && aTracks[0] ? aTracks[0] : null;
+      const aUrl = aPicked?.url || null;
+      const isAudioAac = Boolean(aPicked && (/mp4a/i.test(aPicked.type + aPicked.encoding) || aPicked.itag === '140'));
 
       if (!vUrl || !FFMPEG_AVAILABLE) {
         res.status(404).json({ error: 'HLS source streams unavailable' });
@@ -2973,14 +3494,14 @@ async function startServer(): Promise<void> {
         ffArgs.push('-http_proxy', streamConfig.outboundProxyUrl);
       }
       ffArgs.push(
-        '-user_agent', getUpstreamUaForUrl(vUrl),
+        '-user_agent', ANUBIS_UA,
         '-reconnect', '1',
         '-reconnect_streamed', '1',
         '-i', vUrl,
       );
       if (aUrl) {
         ffArgs.push(
-          '-user_agent', getUpstreamUaForUrl(aUrl),
+          '-user_agent', ANUBIS_UA,
           '-reconnect', '1',
           '-reconnect_streamed', '1',
           '-i', aUrl,
@@ -2991,14 +3512,13 @@ async function startServer(): Promise<void> {
       ffArgs.push(
         '-c:v', needsTranscode ? 'libx264' : 'copy',
         ...(needsTranscode ? ['-preset', 'veryfast', '-crf', '22'] : []),
-        '-c:a', 'aac',
-        '-b:a', '192k',
+        ...(aUrl && isAudioAac ? ['-c:a', 'copy'] : !aUrl && pickedVideo === prog ? ['-c:a', 'copy'] : ['-c:a', 'aac', '-b:a', '192k']),
         '-hls_time', '3',
         '-hls_list_size', '0',
         '-hls_playlist_type', 'event',
         '-hls_flags', 'temp_file',
         '-hls_segment_filename', path.join(hlsDir, 'seg_%04d.ts'),
-        path.join(hlsDir, 'index.m3u8'),
+        playlistFile,
       );
 
       activeHlsJobs.set(id, { dir: hlsDir, startedAt: Date.now() });
@@ -3012,7 +3532,7 @@ async function startServer(): Promise<void> {
     }
 
     if (file === 'index.m3u8') {
-      const deadline = Date.now() + 8000;
+      const deadline = Date.now() + 12_000;
       while (Date.now() < deadline) {
         if (fs.existsSync(targetFile) && fs.readFileSync(targetFile, 'utf8').includes('.ts')) {
           break;
@@ -3023,9 +3543,14 @@ async function startServer(): Promise<void> {
         res.status(504).json({ error: 'HLS manifest preparation timeout' });
         return;
       }
+      const rawPlaylist = fs.readFileSync(targetFile, 'utf8');
+      const rewritten = rawPlaylist
+        .split('\n')
+        .map((line) => (line.trim().endsWith('.ts') ? `${segmentPrefix}/${line.trim()}` : line))
+        .join('\n');
       res.setHeader('Content-Type', 'application/vnd.apple.mpegurl');
       res.setHeader('Cache-Control', 'no-store');
-      res.send(fs.readFileSync(targetFile, 'utf8'));
+      res.send(rewritten);
       return;
     }
 
@@ -3035,6 +3560,12 @@ async function startServer(): Promise<void> {
     }
     res.setHeader('Content-Type', 'video/mp2t');
     fs.createReadStream(targetFile).pipe(res);
+  }
+
+  app.get('/api/v1/stream/hls-gen/:id/:file', async (req, res) => {
+    const id = String(req.params.id || '').replace(/[^a-zA-Z0-9_-]/g, '');
+    const file = String(req.params.file || '');
+    await serveHlsFile(id, file, `/api/v1/stream/hls-gen/${encodeURIComponent(id)}`, res);
   });
 
   // 12d. GET /api/v1/download/:id (Video & Audio File Download: MP4 Mux / Progressive MP4 / Audio)
@@ -3318,19 +3849,9 @@ async function startServer(): Promise<void> {
         return;
       }
 
-      const fetchRange = async (target: string) =>
-        proxiedFetch(target, {
-          headers: buildMaskedUpstreamHeaders(req.headers.range, target),
-          signal: AbortSignal.timeout(20000),
-        });
-
-      let upstream = await fetchRange(picked.url);
-      if (upstream.status === 403 || upstream.status === 410 || upstream.status === 404) {
-        picked = await resolveTargetUrl(true);
-        if (picked?.url) {
-          upstream = await fetchRange(picked.url);
-        }
-      }
+      const targetUrl = picked?.url || companionStreamUrl(id, picked?.itag || requestedItag || '18');
+      const targetItag = picked?.itag || requestedItag || '18';
+      const upstream = await fetchUpstreamMediaWithFailover(id, targetItag, targetUrl, req.headers.range);
 
       res.status(upstream.status);
       const ct = upstream.headers.get('content-type') || 'video/mp4';
@@ -3340,7 +3861,7 @@ async function startServer(): Promise<void> {
       res.setHeader('Content-Type', ct);
       res.setHeader('Accept-Ranges', ar);
       res.setHeader('X-Googlevideo-Relay', 'ip-masked');
-      res.setHeader('X-Googlevideo-Itag', picked?.itag || 'auto');
+      res.setHeader('X-Googlevideo-Itag', targetItag);
       if (cl) res.setHeader('Content-Length', cl);
       if (cr) res.setHeader('Content-Range', cr);
 
@@ -4008,7 +4529,181 @@ async function startServer(): Promise<void> {
     return fresh;
   }
 
-  // 独自 API 6: GET /api/kuro/stable-stream/:id (安定型: 学校端末対応 H.264 MP4 + Eduフォールバック)
+  // -------------------------------------------------------------------------
+  // 16b. 5 Dedicated Stream-Capable Servers (/api/server/1..5/health|info|stream)
+  // -------------------------------------------------------------------------
+  app.get('/api/server/:serverNum/health', (req, res) => {
+    const num = Number(req.params.serverNum);
+    const inst = ORIGIN_INSTANCES.find((s) => s.serverNumber === num);
+    if (!inst) {
+      res.status(404).json({ error: 'Server number must be 1 to 5' });
+      return;
+    }
+    res.json({
+      ok: true,
+      serverNumber: inst.serverNumber,
+      id: inst.id,
+      name: inst.name,
+      port: inst.port,
+      tier: inst.tier,
+      tierLabel: inst.tierLabel,
+      protocol: inst.protocol,
+      capabilities: inst.capabilities,
+      infoEndpoint: `/api/server/${num}/info/:id`,
+      streamEndpoint: `/api/server/${num}/stream/:id`,
+      handledRequests: instanceRequestCounts.get(inst.port) || 0,
+    });
+  });
+
+  app.get('/api/server/:serverNum/info/:id', async (req, res) => {
+    const num = Number(req.params.serverNum);
+    const videoId = String(req.params.id || '').trim();
+    const inst = ORIGIN_INSTANCES.find((s) => s.serverNumber === num);
+    if (!inst) {
+      res.status(404).json({ error: 'Server number must be 1 to 5' });
+      return;
+    }
+    if (!/^[a-zA-Z0-9_-]{6,20}$/.test(videoId)) {
+      res.status(400).json({ error: '不正な動画IDです' });
+      return;
+    }
+    try {
+      const video = await ensureVideoCached(videoId, req.query.refresh === 'true');
+      const vTracks = video.adaptiveFormats
+        .filter((f) => f.type.startsWith('video/'))
+        .sort((a, b) => (parseInt(b.qualityLabel || '0', 10) || 0) - (parseInt(a.qualityLabel || '0', 10) || 0));
+      const aTracks = video.adaptiveFormats
+        .filter((f) => f.type.startsWith('audio/'))
+        .sort((a, b) => (Number(b.bitrate) || 0) - (Number(a.bitrate) || 0));
+      const bestV = vTracks[0] || null;
+      const bestA = aTracks[0] || null;
+      const bestProg = video.formatStreams[0] || null;
+
+      res.setHeader('X-Cache', 'DYNAMIC');
+      res.setHeader('X-Upstream-Node', inst.id);
+      res.json({
+        ok: true,
+        serverNumber: inst.serverNumber,
+        serverId: inst.id,
+        serverName: inst.name,
+        port: inst.port,
+        tier: inst.tier,
+        videoId,
+        title: video.title,
+        author: video.author,
+        lengthSeconds: video.lengthSeconds,
+        maxResolution: bestV?.qualityLabel || bestProg?.qualityLabel || video.maxResolution,
+        playableStreamUrl: `/api/server/${num}/stream/${encodeURIComponent(videoId)}`,
+        mp4Url: `/api/v1/stream/googlevideo/${encodeURIComponent(videoId)}?itag=${encodeURIComponent(bestProg?.itag || '18')}`,
+        muxUrl:
+          bestV && bestA && FFMPEG_AVAILABLE
+            ? `/api/v1/stream/mux?id=${encodeURIComponent(videoId)}&v=${encodeURIComponent(bestV.itag)}&a=${encodeURIComponent(bestA.itag)}`
+            : null,
+        hlsUrl: `/api/server/3/stream/${encodeURIComponent(videoId)}`,
+        directStreamAvailable: Boolean(video.directStreamAvailable),
+        formatCount: video.formatStreams.length + video.adaptiveFormats.length,
+        formatStreams: video.formatStreams,
+        adaptiveFormats: video.adaptiveFormats,
+      });
+    } catch (err) {
+      res.status(502).json({ error: err instanceof Error ? err.message : '動画ストリーム情報の取得に失敗しました' });
+    }
+  });
+
+  app.get('/api/server/:serverNum/stream/:id', async (req, res) => {
+    const num = Number(req.params.serverNum);
+    const videoId = String(req.params.id || '').trim();
+    const inst = ORIGIN_INSTANCES.find((s) => s.serverNumber === num);
+    if (!inst) {
+      res.status(404).json({ error: 'Server number must be 1 to 5' });
+      return;
+    }
+    if (!/^[a-zA-Z0-9_-]{6,20}$/.test(videoId)) {
+      res.status(400).json({ error: '不正な動画IDです' });
+      return;
+    }
+
+    res.setHeader('X-Kuro-Server-Id', inst.id);
+    res.setHeader('X-Kuro-Server-Port', String(inst.port));
+
+    try {
+      const video = await ensureVideoCached(videoId, req.query.refresh === 'true');
+      const requestedItag = String(req.query.itag || '').trim();
+
+      if (num === 3) {
+        // Server 3: Adaptive HLS (.m3u8) streaming
+        await serveHlsFile(
+          videoId,
+          'index.m3u8',
+          `/api/server/3/hls/${encodeURIComponent(videoId)}`,
+          res,
+        );
+        return;
+      }
+
+      if (num === 2 || num === 5) {
+        // Server 2 (High Quality 4K/1080p Mux MP4) & Server 5 (Auto Failover Mux -> Progressive MP4)
+        const maxH = Number(req.query.maxHeight || req.query.q || (num === 2 ? 2160 : 1080)) || 2160;
+        const seekSec = Math.max(0, Number(req.query.t || 0) || 0);
+        await streamMuxedMp4Response(videoId, res, {
+          maxHeight: maxH,
+          seekSec,
+          vItag: requestedItag || undefined,
+          rangeHeader: req.headers.range,
+        });
+        return;
+      }
+
+      // Server 1 (Ultra-Fast Range MP4) & Server 4 (Ultra-Stable Universal H.264/AAC MP4)
+      const progFmt =
+        (requestedItag
+          ? [...video.formatStreams, ...video.adaptiveFormats].find((f) => f.itag === requestedItag)
+          : null) ||
+        video.formatStreams.find((f) => f.itag === '18') ||
+        video.formatStreams[0] ||
+        null;
+      const pickedItag = progFmt?.itag || requestedItag || '18';
+      const pickedUrl = progFmt?.url || companionStreamUrl(videoId, pickedItag);
+      const upstream = await fetchUpstreamMediaWithFailover(videoId, pickedItag, pickedUrl, req.headers.range);
+
+      res.status(upstream.status);
+      res.setHeader('Content-Type', upstream.headers.get('content-type') || 'video/mp4');
+      res.setHeader('Accept-Ranges', upstream.headers.get('accept-ranges') || 'bytes');
+      res.setHeader('X-Stream-Mode', num === 1 ? 'ultra-fast-range-mp4' : 'ultra-stable-h264-mp4');
+      res.setHeader('X-Googlevideo-Itag', pickedItag);
+      const cl = upstream.headers.get('content-length');
+      const cr = upstream.headers.get('content-range');
+      if (cl) res.setHeader('Content-Length', cl);
+      if (cr) res.setHeader('Content-Range', cr);
+      if (!upstream.body) {
+        res.end();
+        return;
+      }
+      const reader = upstream.body.getReader();
+      res.on('close', () => {
+        if (!res.writableEnded) reader.cancel().catch(() => {});
+      });
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        if (!res.writableEnded) res.write(Buffer.from(value));
+      }
+      res.end();
+    } catch (err) {
+      if (!res.headersSent) {
+        res.status(502).json({ error: err instanceof Error ? err.message : 'ストリーム配信エラー' });
+      }
+    }
+  });
+
+  app.get('/api/server/:serverNum/hls/:id/:file', async (req, res) => {
+    const id = String(req.params.id || '').replace(/[^a-zA-Z0-9_-]/g, '');
+    const file = String(req.params.file || '');
+    const num = Number(req.params.serverNum) || 3;
+    await serveHlsFile(id, file, `/api/server/${num}/hls/${encodeURIComponent(id)}`, res);
+  });
+
+  // 独自 API 6: GET /api/kuro/stable-stream/:id (安定型: 学校端末対応 H.264 MP4 + Server 4 直結)
   app.get('/api/kuro/stable-stream/:id', async (req, res) => {
     const videoId = String(req.params.id || '').trim();
     if (!/^[a-zA-Z0-9_-]{6,20}$/.test(videoId)) {
@@ -4025,26 +4720,25 @@ async function startServer(): Promise<void> {
       const eduEmbed = video.eduEmbed || buildEduEmbedConfig(videoId, video.title, video.author);
 
       res.setHeader('X-Cache', 'DYNAMIC');
-      res.setHeader('X-Upstream-Node', 'kuro-inst-01');
+      res.setHeader('X-Upstream-Node', 'kuro-srv-4');
       res.json({
         tier: 'stable',
-        serverId: 'kuro-inst-01',
+        serverId: 'kuro-srv-4',
         videoId,
         title: video.title,
         author: video.author,
-        compatibleMp4Url: h264Prog
-          ? `/api/v1/stream/googlevideo/${encodeURIComponent(videoId)}?itag=${encodeURIComponent(h264Prog.itag)}&profile=stable`
-          : null,
+        compatibleMp4Url: `/api/server/4/stream/${encodeURIComponent(videoId)}`,
+        googlevideoRangeUrl: `/api/v1/stream/googlevideo/${encodeURIComponent(videoId)}?itag=${encodeURIComponent(h264Prog?.itag || '18')}&profile=stable`,
         relayFallbackUrl: video.clientRelayStreams?.[0]?.url || null,
         eduEmbed,
-        directStreamAvailable: Boolean(h264Prog),
+        directStreamAvailable: Boolean(video.directStreamAvailable),
       });
     } catch (err) {
       res.status(502).json({ error: err instanceof Error ? err.message : '安定型ストリームの取得に失敗しました' });
     }
   });
 
-  // 独自 API 7: GET /api/kuro/fast-stream/:id (高速型: Googlevideo IP秘匿 Range MP4)
+  // 独自 API 7: GET /api/kuro/fast-stream/:id (高速型: Googlevideo IP秘匿 Range MP4 + Server 1 直結)
   app.get('/api/kuro/fast-stream/:id', async (req, res) => {
     const videoId = String(req.params.id || '').trim();
     if (!/^[a-zA-Z0-9_-]{6,20}$/.test(videoId)) {
@@ -4055,30 +4749,28 @@ async function startServer(): Promise<void> {
       const video = await ensureVideoCached(videoId, req.query.refresh === 'true');
       const bestProg = video.formatStreams[0] || null;
       const bestAdaptive = video.adaptiveFormats.find((f) => f.type.startsWith('video/mp4')) || video.adaptiveFormats[0] || null;
-      const targetItag = bestProg?.itag || bestAdaptive?.itag || '22';
+      const targetItag = bestProg?.itag || bestAdaptive?.itag || '18';
 
       res.setHeader('X-Cache', 'DYNAMIC');
-      res.setHeader('X-Upstream-Node', 'kuro-inst-04');
+      res.setHeader('X-Upstream-Node', 'kuro-srv-1');
       res.json({
         tier: 'fast',
-        serverId: 'kuro-inst-04',
+        serverId: 'kuro-srv-1',
         videoId,
         title: video.title,
         author: video.author,
-        googlevideoRelayUrl: video.directStreamAvailable
-          ? `/api/v1/stream/googlevideo/${encodeURIComponent(videoId)}?itag=${encodeURIComponent(targetItag)}&profile=fast`
-          : null,
-        directGooglevideoUrl: bestProg?.url || bestAdaptive?.url || null,
-        hlsUrl: video.hlsProxyUrl || null,
+        googlevideoRelayUrl: `/api/server/1/stream/${encodeURIComponent(videoId)}`,
+        directGooglevideoUrl: bestProg?.url || bestAdaptive?.url || companionStreamUrl(videoId, targetItag),
+        hlsUrl: `/api/server/3/stream/${encodeURIComponent(videoId)}`,
         eduEmbed: video.eduEmbed || buildEduEmbedConfig(videoId, video.title, video.author),
-        directStreamAvailable: video.directStreamAvailable,
+        directStreamAvailable: Boolean(video.directStreamAvailable),
       });
     } catch (err) {
       res.status(502).json({ error: err instanceof Error ? err.message : '高速型ストリームの取得に失敗しました' });
     }
   });
 
-  // 独自 API 8: GET /api/kuro/hq-stream/:id (高画質型: 4K60/HDR + FFmpeg MP4結合 + HLS)
+  // 独自 API 8: GET /api/kuro/hq-stream/:id (高画質型: 4K60/HDR + FFmpeg MP4結合 + Server 2/3 直結)
   app.get('/api/kuro/hq-stream/:id', async (req, res) => {
     const videoId = String(req.params.id || '').trim();
     if (!/^[a-zA-Z0-9_-]{6,20}$/.test(videoId)) {
@@ -4098,28 +4790,28 @@ async function startServer(): Promise<void> {
       const bestA = aTracks[0] || null;
 
       res.setHeader('X-Cache', 'DYNAMIC');
-      res.setHeader('X-Upstream-Node', 'kuro-inst-07');
+      res.setHeader('X-Upstream-Node', 'kuro-srv-2');
       res.json({
         tier: 'hq',
-        serverId: 'kuro-inst-07',
+        serverId: 'kuro-srv-2',
         videoId,
         title: video.title,
         maxQuality: bestV?.qualityLabel || video.maxResolution || '1080p',
         muxUrl:
           bestV && bestA && FFMPEG_AVAILABLE
-            ? `/api/v1/stream/mux?id=${encodeURIComponent(videoId)}&v=${encodeURIComponent(bestV.itag)}&a=${encodeURIComponent(bestA.itag)}`
-            : null,
-        hlsUrl: video.hlsProxyUrl || null,
+            ? `/api/server/2/stream/${encodeURIComponent(videoId)}`
+            : `/api/v1/stream/mux?id=${encodeURIComponent(videoId)}`,
+        hlsUrl: `/api/server/3/stream/${encodeURIComponent(videoId)}`,
         videoItag: bestV?.itag || null,
         audioItag: bestA?.itag || null,
-        directStreamAvailable: Boolean(bestV && bestA) || Boolean(video.hlsProxyUrl),
+        directStreamAvailable: Boolean(video.directStreamAvailable),
       });
     } catch (err) {
       res.status(502).json({ error: err instanceof Error ? err.message : '高画質型ストリームの取得に失敗しました' });
     }
   });
 
-  // 独自 API 9: GET /api/kuro/auto-fallback/:id (環境判定付き10インスタンス自動フォールバック統合 API)
+  // 独自 API 9: GET /api/kuro/auto-fallback/:id (5ストリームサーバー環境判定付き自動フォールバック統合 API)
   app.get('/api/kuro/auto-fallback/:id', async (req, res) => {
     const videoId = String(req.params.id || '').trim();
     const profile = String(req.query.profile || 'auto');
@@ -4147,76 +4839,63 @@ async function startServer(): Promise<void> {
 
     const muxUrl =
       capV && bestA && FFMPEG_AVAILABLE
-        ? `/api/v1/stream/mux?id=${encodeURIComponent(videoId)}&v=${encodeURIComponent(capV.itag)}&a=${encodeURIComponent(bestA.itag)}`
+        ? `/api/server/2/stream/${encodeURIComponent(videoId)}?maxHeight=${encodeURIComponent(String(maxH))}`
         : null;
-    const gvUrl = bestProg
-      ? `/api/v1/stream/googlevideo/${encodeURIComponent(videoId)}?itag=${encodeURIComponent(bestProg.itag)}&profile=${profile === 'stable' ? 'stable' : 'fast'}`
-      : null;
-    const hlsUrl = video?.hlsProxyUrl || null;
+    const gvUrl = `/api/server/1/stream/${encodeURIComponent(videoId)}`;
+    const hlsUrl = `/api/server/3/stream/${encodeURIComponent(videoId)}`;
+    const stableUrl = `/api/server/4/stream/${encodeURIComponent(videoId)}`;
     const eduEmbed = video?.eduEmbed || buildEduEmbedConfig(videoId, video?.title || '', video?.author || '');
 
     let selectedTier: ServerTier = 'fast';
-    let selectedServer = 'kuro-inst-03';
-    let selectedEngine: AutoFallbackStreamResponse['selectedEngine'] = 'edu-classroom';
-    let streamUrl: string | null = eduEmbed.classroomUrl;
+    let selectedServer = 'kuro-srv-1';
+    let selectedEngine: AutoFallbackStreamResponse['selectedEngine'] = 'googlevideo';
+    let streamUrl: string | null = gvUrl;
 
     const tryHq = () => {
       const ms = Math.round((performance.now() - tStart) * 100) / 100;
       if (muxUrl) {
-        attempts.push({ serverId: 'kuro-inst-07', serverName: '高画質インスタンス7 (4K MP4結合 :3007)', tier: 'hq', ok: true, latencyMs: ms, detail: `${capV?.qualityLabel || 'HD'} MP4 Mux 解決` });
+        attempts.push({ serverId: 'kuro-srv-2', serverName: 'Stream Server 2 (4K/1080p FFmpeg Mux :3002)', tier: 'hq', ok: true, latencyMs: ms, detail: `${capV?.qualityLabel || 'HD'} MP4 Mux 解決` });
         selectedTier = 'hq';
-        selectedServer = 'kuro-inst-07';
+        selectedServer = 'kuro-srv-2';
         selectedEngine = 'mux';
         streamUrl = muxUrl;
         return true;
       }
       if (hlsUrl) {
-        attempts.push({ serverId: 'kuro-inst-08', serverName: '高画質インスタンス8 (Adaptive HLS :3008)', tier: 'hq', ok: true, latencyMs: ms, detail: 'HLS .m3u8 解決' });
+        attempts.push({ serverId: 'kuro-srv-3', serverName: 'Stream Server 3 (Adaptive HLS :3003)', tier: 'hq', ok: true, latencyMs: ms, detail: 'HLS .m3u8 解決' });
         selectedTier = 'hq';
-        selectedServer = 'kuro-inst-08';
+        selectedServer = 'kuro-srv-3';
         selectedEngine = 'hls';
         streamUrl = hlsUrl;
         return true;
       }
-      attempts.push({ serverId: 'kuro-inst-07', serverName: '高画質インスタンス7 (4K MP4結合 :3007)', tier: 'hq', ok: false, latencyMs: ms, detail: '高画質ストリーム未解決・次インスタンスへフォールバック' });
       return false;
     };
 
     const tryFast = () => {
       const ms = Math.round((performance.now() - tStart) * 100) / 100;
-      if (gvUrl) {
-        attempts.push({ serverId: 'kuro-inst-04', serverName: '高速インスタンス4 (Googlevideo IP偽装MP4 :3004)', tier: 'fast', ok: true, latencyMs: ms, detail: `itag=${bestProg?.itag} Range中継準備完了` });
+      if (video?.directStreamAvailable || bestProg) {
+        attempts.push({ serverId: 'kuro-srv-1', serverName: 'Stream Server 1 (超高速 Range MP4 :3001)', tier: 'fast', ok: true, latencyMs: ms, detail: `itag=${bestProg?.itag || '18'} 206 Range配信準備完了` });
         selectedTier = 'fast';
-        selectedServer = 'kuro-inst-04';
+        selectedServer = 'kuro-srv-1';
         selectedEngine = 'googlevideo';
         streamUrl = gvUrl;
         return true;
       }
-      attempts.push({ serverId: 'kuro-inst-04', serverName: '高速インスタンス4 (Googlevideo IP偽装MP4 :3004)', tier: 'fast', ok: false, latencyMs: ms, detail: '直接MP4未解決・安定型へフォールバック' });
       return false;
     };
 
     const tryStable = () => {
       const ms = Math.round((performance.now() - tStart) * 100) / 100;
-      if (bestProg?.proxyUrl) {
-        attempts.push({ serverId: 'kuro-inst-01', serverName: '安定インスタンス1 (H.264 互換MP4 :3001)', tier: 'stable', ok: true, latencyMs: ms, detail: '学校端末互換 H.264/AAC 解決' });
-        selectedTier = 'stable';
-        selectedServer = 'kuro-inst-01';
-        selectedEngine = 'progressive';
-        streamUrl = bestProg.proxyUrl;
-        return true;
-      }
-      attempts.push({ serverId: 'kuro-inst-03', serverName: '安定インスタンス3 (Classroom/Kahoot Edu再生 :3003)', tier: 'stable', ok: true, latencyMs: ms, detail: 'Classroom / Kahoot 教育用埋め込みへ自動フォールバック' });
+      attempts.push({ serverId: 'kuro-srv-4', serverName: 'Stream Server 4 (超安定 H.264/AAC MP4 :3004)', tier: 'stable', ok: true, latencyMs: ms, detail: '学校端末互換 H.264/AAC MP4 + 統合フォールバック' });
       selectedTier = 'stable';
-      selectedServer = 'kuro-inst-03';
-      selectedEngine = 'edu-classroom';
-      streamUrl = eduEmbed.classroomUrl;
+      selectedServer = 'kuro-srv-4';
+      selectedEngine = 'progressive';
+      streamUrl = stableUrl;
       return true;
     };
 
-    if (profile === 'edu') {
-      tryStable();
-    } else if (profile === 'hq') {
+    if (profile === 'hq') {
       if (!tryHq() && !tryFast()) tryStable();
     } else if (profile === 'stable' || downlink < 5) {
       tryStable();
@@ -4245,7 +4924,7 @@ async function startServer(): Promise<void> {
       progressiveUrl: gvUrl,
       eduEmbed,
       attempts,
-      maxQuality: capV?.qualityLabel || bestProg?.qualityLabel || video?.maxResolution || 'Auto',
+      maxQuality: capV?.qualityLabel || bestProg?.qualityLabel || video?.maxResolution || '1080p',
     };
 
     res.setHeader('X-Cache', 'DYNAMIC');
@@ -4381,7 +5060,7 @@ async function startServer(): Promise<void> {
             id: inst.id,
             name: inst.name,
             category: 'self-cluster',
-            categoryLabel: `自前10インスタンス (${inst.tierLabel})`,
+            categoryLabel: `5ストリームサーバー (${inst.tierLabel})`,
             url: `${inst.endpoint} (:${inst.port})`,
             region: 'JP-Edge',
             statusCode: probe.statusCode,
@@ -5290,7 +5969,7 @@ async function startServer(): Promise<void> {
     }
   });
 
-  // Start 10 isolated self-hosted HTTP Origin Instances on loopback 127.0.0.1:3001 - 3010
+  // Start 5 isolated self-hosted Stream Origin Servers on loopback 127.0.0.1:3001 - 3005
   await Promise.all(
     ORIGIN_INSTANCES.map(
       (inst) =>
@@ -5304,7 +5983,7 @@ async function startServer(): Promise<void> {
             const token = req.headers['x-kuro-origin-token'];
             if (token !== ORIGIN_AUTH_TOKEN) {
               res.status(403).json({
-                error: `オリジンインスタンス ${inst.id} (:${inst.port}) への直接アクセスは遮断されました (403 Forbidden)。リバースプロキシ (:3000) 経由でアクセスしてください。`,
+                error: `オリジンサーバー ${inst.id} (:${inst.port}) への直接アクセスは遮断されました (403 Forbidden)。リバースプロキシ (:3000) 経由でアクセスしてください。`,
                 originIsolated: true,
                 instanceId: inst.id,
                 port: inst.port,
@@ -5321,6 +6000,7 @@ async function startServer(): Promise<void> {
           instApp.get('/health', (_req, res) => {
             res.json({
               ok: true,
+              serverNumber: inst.serverNumber,
               id: inst.id,
               name: inst.name,
               port: inst.port,
@@ -5339,13 +6019,14 @@ async function startServer(): Promise<void> {
     ),
   );
   console.log(
-    `Self-Hosted Invidious 10 Origin Instances isolated on http://${ORIGIN_HOST}:3001-3010`,
+    `KuroStream 5 Dedicated Stream Servers isolated on http://${ORIGIN_HOST}:3001-3005`,
   );
 
-  // Background external node pool warm-up so Auto-Recovery is pre-ranked immediately
+  // Background Anubis & Node warm-up so first stream request is instant
   const warmUpTimer = setTimeout(() => {
+    solveAnubisForOrigin(`${POKETUBE_BASE}/watch?v=aqz-KE-bpKQ`).catch(() => {});
     buildLiveServersSnapshot().catch(() => {});
-  }, 3000);
+  }, 1500);
   warmUpTimer.unref?.();
 
   const periodicRefreshTimer = setInterval(() => {
@@ -5354,7 +6035,8 @@ async function startServer(): Promise<void> {
   periodicRefreshTimer.unref?.();
 
   // -------------------------------------------------------------------------
-  // 2. Public Reverse Proxy & WAF Security Shield (0.0.0.0:3000)
+  // 2. Headless Public API Gateway & Reverse Proxy Shield (0.0.0.0:3000)
+  //    (Pure JSON + Media Stream APIs — Zero HTML served)
   // -------------------------------------------------------------------------
   const proxyApp = express();
   proxyApp.use(
@@ -5368,16 +6050,20 @@ async function startServer(): Promise<void> {
         'X-Origin-Protected',
         'X-Kuro-Routed-Port',
         'X-Kuro-Instance-Id',
+        'X-Kuro-Server-Id',
+        'X-Stream-Mode',
+        'X-Stream-Quality',
+        'Content-Range',
+        'Accept-Ranges',
       ],
     }),
   );
 
-  // Global Security Headers on every Proxy response (strict-origin-when-cross-origin preserves YouTube embed Referer to prevent Error 152-2)
+  // Global Security Headers on every Proxy response
   proxyApp.use((_req, res, next) => {
     res.setHeader('X-Proxy-Shield', 'active');
     res.setHeader('X-Origin-Protected', 'true');
     res.setHeader('X-Content-Type-Options', 'nosniff');
-    res.setHeader('X-Frame-Options', 'SAMEORIGIN');
     res.setHeader('Referrer-Policy', 'strict-origin-when-cross-origin');
     next();
   });
@@ -5387,8 +6073,8 @@ async function startServer(): Promise<void> {
     const t0 = performance.now();
     const payload: KuroEdgeShieldResponse = {
       status: 'PROTECTED',
-      originAddress: `${ORIGIN_HOST}:3001-3010 (10インスタンス隔離)`,
-      proxyAddress: `0.0.0.0:${PORT} (リバースプロキシ防御)`,
+      originAddress: `${ORIGIN_HOST}:3001-3005 (5ストリームサーバー隔離)`,
+      proxyAddress: `0.0.0.0:${PORT} (ヘッドレスAPIゲートウェイ)`,
       originIsolationActive: true,
       rules: { ...shieldRules },
       counters: { ...shieldCounters },
@@ -5445,16 +6131,17 @@ async function startServer(): Promise<void> {
     }
   });
 
-  // Reverse Proxy Shield Middleware forwarding /api/* and /latest_version across 10 Origin Instances (3001-3010) with failover
+  // Reverse Proxy Shield Middleware forwarding /api/* and /latest_version across 5 Origin Stream Servers (3001-3005)
   proxyApp.use(['/api', '/latest_version'], (req, res) => {
     const reqStart = performance.now();
     const rawIp = req.ip || req.socket.remoteAddress || '127.0.0.1';
     const maskedIp = maskIp(rawIp);
 
-    // Skip rate limit for lightweight thumbnail / media assets so grids stay ultra-fast
-    const isThumbnail =
+    const isLightweightMedia =
       req.originalUrl.startsWith('/api/v1/thumbnail/') ||
-      req.originalUrl.startsWith('/api/v1/media-proxy');
+      req.originalUrl.startsWith('/api/v1/media-proxy') ||
+      req.originalUrl.includes('/hls/') ||
+      req.originalUrl.includes('/hls-gen/');
 
     // 1. WAF Inspection
     if (shieldRules.wafStrictMode) {
@@ -5481,7 +6168,7 @@ async function startServer(): Promise<void> {
     }
 
     // 2. Sliding-Window Rate Limiter
-    if (!isThumbnail) {
+    if (!isLightweightMedia) {
       const rate = checkRateLimit(rawIp);
       if (!rate.allowed) {
         shieldCounters.totalProxied += 1;
@@ -5505,7 +6192,7 @@ async function startServer(): Promise<void> {
       }
     }
 
-    // 3. Header Sanitization + Signed Origin Forwarding across 10 Instances
+    // 3. Header Sanitization + Signed Origin Forwarding across 5 Stream Servers
     const forwardHeaders: Record<string, string | string[]> = {};
     for (const [k, v] of Object.entries(req.headers)) {
       if (v === undefined) continue;
@@ -5549,7 +6236,7 @@ async function startServer(): Promise<void> {
           const statusCode = proxyRes.statusCode || 502;
           const xCache = String(proxyRes.headers['x-cache'] || '');
 
-          if (!isThumbnail) {
+          if (!isLightweightMedia) {
             shieldCounters.totalProxied += 1;
             if (xCache === 'HIT') {
               shieldCounters.cacheHits += 1;
@@ -5602,24 +6289,58 @@ async function startServer(): Promise<void> {
     forwardToPort(0);
   });
 
-  // Vite Dev Middleware or Production Static Serving on Public Proxy (0.0.0.0:3000)
-  if (process.env.NODE_ENV !== 'production') {
-    const vite = await createViteServer({
-      server: { middlewareMode: true },
-      appType: 'spa',
+  // Pure Headless Server Mode (Zero HTML / Zero Vite SPA)
+  proxyApp.get(['/', '/health'], (_req, res) => {
+    res.setHeader('Content-Type', 'application/json; charset=utf-8');
+    res.json({
+      ok: true,
+      service: 'KuroStream Headless 5-Server Stream Cluster',
+      mode: 'headless-server-only',
+      htmlDisabled: true,
+      uptimeSeconds: Math.floor((Date.now() - START_TIME) / 1000),
+      gatewayPort: PORT,
+      streamServers: ORIGIN_INSTANCES.map((s) => ({
+        serverNumber: s.serverNumber,
+        id: s.id,
+        name: s.name,
+        port: s.port,
+        tier: s.tier,
+        tierLabel: s.tierLabel,
+        protocol: s.protocol,
+        capabilities: s.capabilities,
+        handledRequests: instanceRequestCounts.get(s.port) || 0,
+        endpoints: {
+          health: `/api/server/${s.serverNumber}/health`,
+          info: `/api/server/${s.serverNumber}/info/:id`,
+          stream: `/api/server/${s.serverNumber}/stream/:id`,
+        },
+      })),
+      endpoints: {
+        videoInfo: '/api/v1/videos/:id',
+        search: '/api/v1/search?q=...',
+        googlevideoRangeMp4: '/api/v1/stream/googlevideo/:id?itag=18',
+        ffmpegMux1080p4kMp4: '/api/v1/stream/mux?id=:id',
+        adaptiveHlsM3u8: '/api/v1/stream/hls-gen/:id/index.m3u8',
+        autoFallback: '/api/kuro/auto-fallback/:id',
+        clusterNodes: '/api/kuro/cluster-nodes',
+        liveServers: '/api/kuro/live-servers',
+        edgeShield: '/api/kuro/edge-shield',
+        eduEmbed: '/api/kuro/edu-embed/:id',
+      },
     });
-    proxyApp.use(vite.middlewares);
-  } else {
-    const distPath = path.resolve(__dirname, 'dist');
-    proxyApp.use(express.static(distPath));
-    proxyApp.get('*', (_req, res) => {
-      res.sendFile(path.join(distPath, 'index.html'));
+  });
+
+  proxyApp.use((req, res) => {
+    res.status(404).json({
+      error: 'Endpoint not found (headless stream server mode — HTML disabled)',
+      path: req.originalUrl,
+      index: '/',
     });
-  }
+  });
 
   proxyApp.listen(PORT, '0.0.0.0', () => {
     console.log(
-      `KuroStream Reverse Proxy Shield listening on http://0.0.0.0:${PORT} -> protected 10-instance cluster ${ORIGIN_HOST}:3001-3010`,
+      `KuroStream Headless API Gateway listening on http://0.0.0.0:${PORT} -> 5 Stream Servers ${ORIGIN_HOST}:3001-3005`,
     );
   });
 }
